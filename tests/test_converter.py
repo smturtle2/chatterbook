@@ -292,3 +292,36 @@ def test_pkg_resources_shim_supports_resource_filename(monkeypatch):
     path = pkg_resources.resource_filename("chatterbook", "__init__.py")
 
     assert path.endswith("chatterbook/__init__.py")
+
+
+def test_generate_audio_suppresses_model_output(capsys):
+    class LoudModel:
+        def generate(self, text, **kwargs):
+            print("Sampling: noisy stdout")
+            print("Sampling: noisy stderr", file=sys.stderr)
+            return text, kwargs
+
+    result = converter._generate_audio(
+        LoudModel(),
+        "hello",
+        show_progress=True,
+        language_id="ko",
+    )
+
+    captured = capsys.readouterr()
+    assert result == ("hello", {"language_id": "ko"})
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_generate_audio_keeps_model_output_when_progress_disabled(capsys):
+    class LoudModel:
+        def generate(self, text, **kwargs):
+            print("visible")
+            return text
+
+    result = converter._generate_audio(LoudModel(), "hello", show_progress=False)
+
+    captured = capsys.readouterr()
+    assert result == "hello"
+    assert captured.out == "visible\n"

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "chatterbook"
-version = "0.2.1"
+version = "0.2.2"
 description = "Convert EPUB books into chapter WAV audio with Chatterbox Multilingual TTS."
 readme = "README.md"
 requires-python = ">=3.10"

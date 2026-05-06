@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 import tempfile
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any, Literal
 
@@ -163,8 +164,10 @@ def _convert_epub_to_wavs(
             texts = _split_blocks(chapter.blocks, max_chars=max_chars)
             for text in texts:
                 wavs.append(
-                    model.generate(
+                    _generate_audio(
+                        model,
                         text,
+                        show_progress=show_progress,
                         language_id=language_id,
                         audio_prompt_path=str(voice_prompt_path)
                         if voice_prompt_path
@@ -399,8 +402,10 @@ def _write_chapter_wavs(
             texts = _split_blocks(chapter.blocks, max_chars=max_chars)
             for text in texts:
                 wavs.append(
-                    model.generate(
+                    _generate_audio(
+                        model,
                         text,
+                        show_progress=show_progress,
                         language_id=language_id,
                         audio_prompt_path=str(voice_prompt_path)
                         if voice_prompt_path
@@ -455,6 +460,29 @@ def _epub_progress(
         colour="green",
         dynamic_ncols=True,
     )
+
+
+def _generate_audio(
+    model: Any,
+    text: str,
+    *,
+    show_progress: bool,
+    **kwargs: Any,
+) -> Any:
+    with _suppress_model_progress(enabled=show_progress):
+        return model.generate(text, **kwargs)
+
+
+@contextmanager
+def _suppress_model_progress(*, enabled: bool) -> Any:
+    if not enabled:
+        with nullcontext():
+            yield
+        return
+
+    with open("/dev/null", "w", encoding="utf-8") as sink:
+        with redirect_stdout(sink), redirect_stderr(sink):
+            yield
 
 
 def _resolve_voice_path(voice_path: str | Path | None) -> Path | None:
