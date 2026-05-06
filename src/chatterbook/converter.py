@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import tempfile
 from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
+import logging
 from pathlib import Path
 from typing import Any, Literal
 
@@ -481,8 +482,31 @@ def _suppress_model_progress(*, enabled: bool) -> Any:
         return
 
     with open("/dev/null", "w", encoding="utf-8") as sink:
-        with redirect_stdout(sink), redirect_stderr(sink):
+        with redirect_stdout(sink), redirect_stderr(sink), _suppress_chatterbox_logs():
             yield
+
+
+@contextmanager
+def _suppress_chatterbox_logs() -> Any:
+    logger_names = [
+        "chatterbox.models.t3.inference.alignment_stream_analyzer",
+    ]
+    previous_levels = {}
+    previous_disabled = {}
+    for name in logger_names:
+        logger = logging.getLogger(name)
+        previous_levels[name] = logger.level
+        previous_disabled[name] = logger.disabled
+        logger.setLevel(logging.ERROR)
+        logger.disabled = True
+
+    try:
+        yield
+    finally:
+        for name in logger_names:
+            logger = logging.getLogger(name)
+            logger.setLevel(previous_levels[name])
+            logger.disabled = previous_disabled[name]
 
 
 def _resolve_voice_path(voice_path: str | Path | None) -> Path | None:

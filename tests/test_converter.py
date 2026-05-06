@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+import logging
 import sys
 
 import pytest
@@ -299,6 +300,9 @@ def test_generate_audio_suppresses_model_output(capsys):
         def generate(self, text, **kwargs):
             print("Sampling: noisy stdout")
             print("Sampling: noisy stderr", file=sys.stderr)
+            logging.getLogger(
+                "chatterbox.models.t3.inference.alignment_stream_analyzer"
+            ).warning("forcing EOS token")
             return text, kwargs
 
     result = converter._generate_audio(
