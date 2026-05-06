@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from ebooklib import epub
 
-from chatterbook.epub import extract_chapters
+from chatterbook.epub import extract_chapters, get_book_title
 
 
 def test_extract_chapters_uses_spine_order(tmp_path):
@@ -33,3 +33,5 @@ def test_extract_chapters_uses_spine_order(tmp_path):
         "002-second-title.wav",
     ]
     assert chapters[0].text == "First Title Hello first."
+    assert chapters[0].blocks == ["First Title", "Hello first."]
+    assert get_book_title(path) == "Fixture"
