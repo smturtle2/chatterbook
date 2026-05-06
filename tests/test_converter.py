@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+import sys
 
 import pytest
 import torch
@@ -253,3 +254,41 @@ def test_build_ffmetadata_preserves_chapter_titles():
     assert "START=1000\nEND=3500" in metadata
     assert "title=제1장 \\= 시작" in metadata
     assert "title=제2장 \\# 끝" in metadata
+
+
+def test_epub_progress_uses_single_total_bar(monkeypatch):
+    calls = []
+
+    class FakeTqdm:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "tqdm.auto",
+        SimpleNamespace(tqdm=FakeTqdm),
+    )
+    chapters = [
+        SimpleNamespace(blocks=["a", "b"]),
+        SimpleNamespace(blocks=["c " * 80]),
+    ]
+
+    progress = converter._epub_progress(chapters, max_chars=120, enabled=True)
+
+    assert isinstance(progress, FakeTqdm)
+    assert len(calls) == 1
+    assert calls[0]["desc"] == "EPUB"
+    assert calls[0]["unit"] == "chunk"
+    assert calls[0]["colour"] == "green"
+    assert calls[0]["total"] == 3
+
+
+def test_pkg_resources_shim_supports_resource_filename(monkeypatch):
+    monkeypatch.delitem(sys.modules, "pkg_resources", raising=False)
+
+    converter._install_pkg_resources_shim()
+    import pkg_resources
+
+    path = pkg_resources.resource_filename("chatterbook", "__init__.py")
+
+    assert path.endswith("chatterbook/__init__.py")

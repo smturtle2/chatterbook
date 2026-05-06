@@ -29,8 +29,8 @@ paragraphs are grouped up to `max_chars`, then assembled into one chapterized
 M4B.
 
 M4B output requires `ffmpeg` on your `PATH`. During conversion, chatterbook shows
-colored `tqdm` progress bars for chapters and text chunks. Pass
-`show_progress=False` to disable them.
+one colored `tqdm` progress bar for the whole EPUB. Pass `show_progress=False`
+to disable it.
 
 To export chapter WAV files instead of one M4B:
 

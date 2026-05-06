@@ -150,43 +150,41 @@ def _convert_epub_to_wavs(
 
     model = _load_model(device=device, t3_model=t3_model)
     torchaudio = _import_torchaudio()
+    progress = _epub_progress(
+        chapters,
+        max_chars=max_chars,
+        enabled=show_progress,
+    )
 
     written_paths: list[Path] = []
-    for chapter, output_path in _progress(
-        list(zip(chapters, output_paths, strict=True)),
-        desc="Chapters",
-        unit="chapter",
-        colour="cyan",
-        enabled=show_progress,
-    ):
-        wavs = []
-        texts = _split_blocks(chapter.blocks, max_chars=max_chars)
-        for text in _progress(
-            texts,
-            desc=chapter.title,
-            unit="chunk",
-            colour="magenta",
-            enabled=show_progress,
-            leave=False,
-        ):
-            wavs.append(
-                model.generate(
-                    text,
-                    language_id=language_id,
-                    audio_prompt_path=str(voice_prompt_path)
-                    if voice_prompt_path
-                    else None,
-                    exaggeration=generation_style.exaggeration,
-                    cfg_weight=generation_style.cfg_weight,
-                    temperature=temperature,
-                    repetition_penalty=repetition_penalty,
-                    min_p=min_p,
-                    top_p=top_p,
+    try:
+        for chapter, output_path in zip(chapters, output_paths, strict=True):
+            wavs = []
+            texts = _split_blocks(chapter.blocks, max_chars=max_chars)
+            for text in texts:
+                wavs.append(
+                    model.generate(
+                        text,
+                        language_id=language_id,
+                        audio_prompt_path=str(voice_prompt_path)
+                        if voice_prompt_path
+                        else None,
+                        exaggeration=generation_style.exaggeration,
+                        cfg_weight=generation_style.cfg_weight,
+                        temperature=temperature,
+                        repetition_penalty=repetition_penalty,
+                        min_p=min_p,
+                        top_p=top_p,
+                    )
                 )
-            )
-        wav = _concat_wavs(wavs)
-        torchaudio.save(str(output_path), wav, model.sr)
-        written_paths.append(output_path)
+                if progress is not None:
+                    progress.update(1)
+            wav = _concat_wavs(wavs)
+            torchaudio.save(str(output_path), wav, model.sr)
+            written_paths.append(output_path)
+    finally:
+        if progress is not None:
+            progress.close()
 
     return written_paths
 
@@ -389,45 +387,43 @@ def _write_chapter_wavs(
     torchaudio = _import_torchaudio()
     chapter_paths: list[Path] = []
     chapter_durations: list[int] = []
-
-    for chapter in _progress(
+    progress = _epub_progress(
         chapters,
-        desc="Chapters",
-        unit="chapter",
-        colour="cyan",
+        max_chars=max_chars,
         enabled=show_progress,
-    ):
-        wavs = []
-        texts = _split_blocks(chapter.blocks, max_chars=max_chars)
-        for text in _progress(
-            texts,
-            desc=chapter.title,
-            unit="chunk",
-            colour="magenta",
-            enabled=show_progress,
-            leave=False,
-        ):
-            wavs.append(
-                model.generate(
-                    text,
-                    language_id=language_id,
-                    audio_prompt_path=str(voice_prompt_path)
-                    if voice_prompt_path
-                    else None,
-                    exaggeration=generation_style.exaggeration,
-                    cfg_weight=generation_style.cfg_weight,
-                    temperature=temperature,
-                    repetition_penalty=repetition_penalty,
-                    min_p=min_p,
-                    top_p=top_p,
-                )
-            )
+    )
 
-        wav = _concat_wavs(wavs)
-        output_path = output_dir / chapter.filename
-        torchaudio.save(str(output_path), wav, model.sr)
-        chapter_paths.append(output_path)
-        chapter_durations.append(_duration_ms(wav, model.sr))
+    try:
+        for chapter in chapters:
+            wavs = []
+            texts = _split_blocks(chapter.blocks, max_chars=max_chars)
+            for text in texts:
+                wavs.append(
+                    model.generate(
+                        text,
+                        language_id=language_id,
+                        audio_prompt_path=str(voice_prompt_path)
+                        if voice_prompt_path
+                        else None,
+                        exaggeration=generation_style.exaggeration,
+                        cfg_weight=generation_style.cfg_weight,
+                        temperature=temperature,
+                        repetition_penalty=repetition_penalty,
+                        min_p=min_p,
+                        top_p=top_p,
+                    )
+                )
+                if progress is not None:
+                    progress.update(1)
+
+            wav = _concat_wavs(wavs)
+            output_path = output_dir / chapter.filename
+            torchaudio.save(str(output_path), wav, model.sr)
+            chapter_paths.append(output_path)
+            chapter_durations.append(_duration_ms(wav, model.sr))
+    finally:
+        if progress is not None:
+            progress.close()
 
     return chapter_paths, chapter_durations
 
@@ -440,21 +436,25 @@ def _safe_filename(value: str) -> str:
     return value or "book"
 
 
-def _progress(
-    items: Any,
+def _epub_progress(
+    chapters: list[Any],
     *,
-    desc: str,
-    unit: str,
-    colour: str,
+    max_chars: int,
     enabled: bool,
-    leave: bool = True,
 ) -> Any:
     if not enabled:
-        return items
+        return None
 
     from tqdm.auto import tqdm
 
-    return tqdm(items, desc=desc, unit=unit, colour=colour, leave=leave)
+    total = sum(len(_split_blocks(chapter.blocks, max_chars=max_chars)) for chapter in chapters)
+    return tqdm(
+        total=total,
+        desc="EPUB",
+        unit="chunk",
+        colour="green",
+        dynamic_ncols=True,
+    )
 
 
 def _resolve_voice_path(voice_path: str | Path | None) -> Path | None:
@@ -542,6 +542,7 @@ def _concat_wavs(wavs: list[Any]) -> Any:
 
 
 def _load_model(*, device: str | None, t3_model: str | None) -> Any:
+    _install_pkg_resources_shim()
     from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 
     selected_device = device or _default_device()
@@ -549,6 +550,23 @@ def _load_model(*, device: str | None, t3_model: str | None) -> Any:
     if t3_model is not None:
         kwargs["t3_model"] = t3_model
     return ChatterboxMultilingualTTS.from_pretrained(**kwargs)
+
+
+def _install_pkg_resources_shim() -> None:
+    import importlib.resources
+    import sys
+    import types
+
+    if "pkg_resources" in sys.modules:
+        return
+
+    module = types.ModuleType("pkg_resources")
+
+    def resource_filename(package_or_requirement: str, resource_name: str) -> str:
+        return str(importlib.resources.files(package_or_requirement) / resource_name)
+
+    module.resource_filename = resource_filename
+    sys.modules["pkg_resources"] = module
 
 
 def _default_device() -> str:
