@@ -26,3 +26,11 @@ class OutputExistsError(ChatterbookError, FileExistsError):
     def __init__(self, paths: Sequence[Path]) -> None:
         joined = ", ".join(str(path) for path in paths)
         super().__init__(f"Output file already exists: {joined}")
+
+
+class GenerationError(ChatterbookError, RuntimeError):
+    def __init__(self, chapter_title: str, text: str) -> None:
+        preview = " ".join(text.split())[:120]
+        super().__init__(
+            f"Failed to generate audio in chapter '{chapter_title}' near: {preview}"
+        )

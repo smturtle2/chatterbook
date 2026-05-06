@@ -11,6 +11,9 @@ convert_epub(
     voice_path="voices/narrator.wav",
     style="warm",
     max_chars=300,
+    speed=0.9,
+    paragraph_pause_ms=600,
+    dialogue_pause_ms=300,
 )
 ```
 
@@ -24,9 +27,15 @@ convert_epub("book.epub", "audiobooks/book.m4b", language="ko")
 `voice_path` is an optional short WAV reference clip for voice cloning. If it is
 omitted, Chatterbox's bundled default conditionals are used.
 
-Long chapters are split on EPUB paragraph boundaries and adjacent short
-paragraphs are grouped up to `max_chars`, then assembled into one chapterized
-M4B.
+Long chapters are split on EPUB paragraph boundaries. Paragraph pauses are
+preserved with inserted silence, and quoted dialogue is generated as separate,
+slightly more expressive audio segments.
+
+The default audiobook pacing is intentionally slower than raw TTS:
+
+- `speed=0.9`
+- `paragraph_pause_ms=600`
+- `dialogue_pause_ms=300`
 
 M4B output requires `ffmpeg` on your `PATH`. During conversion, chatterbook shows
 one colored `tqdm` progress bar for the whole EPUB. Pass `show_progress=False`
