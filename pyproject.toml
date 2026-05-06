@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "chatterbook"
+version = "0.1.0"
+description = "Convert EPUB books into chapter WAV audio with Chatterbox Multilingual TTS."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Small Turtle 2" },
+]
+dependencies = [
+  "beautifulsoup4>=4.12",
+  "chatterbox-tts>=0.1.7,<0.2",
+  "ebooklib>=0.18",
+  "torch>=2",
+  "torchaudio>=2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/chatterbook"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
