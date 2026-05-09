@@ -407,7 +407,7 @@ def test_build_audio_segments_splits_sentences_and_oversized_chunks():
     assert segments[-1].pause_after_ms == 600
 
 
-def test_build_audio_segments_compacts_same_kind_sentences_for_fewer_tts_calls():
+def test_build_audio_segments_preserves_sentence_pauses_by_default():
     segments = converter._build_audio_segments(
         ["첫 문장입니다. 둘째 문장입니다. 셋째 문장입니다."],
         max_chars=120,
@@ -416,10 +416,20 @@ def test_build_audio_segments_compacts_same_kind_sentences_for_fewer_tts_calls()
 
     assert segments == [
         converter.AudioSegment(
-            "첫 문장입니다. 둘째 문장입니다. 셋째 문장입니다.",
+            "첫 문장입니다.",
+            kind="narration",
+            pause_after_ms=300,
+        ),
+        converter.AudioSegment(
+            "둘째 문장입니다.",
+            kind="narration",
+            pause_after_ms=300,
+        ),
+        converter.AudioSegment(
+            "셋째 문장입니다.",
             kind="narration",
             pause_after_ms=600,
-        )
+        ),
     ]
 
 
@@ -435,7 +445,12 @@ def test_build_audio_segments_keeps_dialogue_boundaries_when_compacting():
         converter.AudioSegment("렌은 말했다.", kind="narration", pause_after_ms=300),
         converter.AudioSegment("“불.”", kind="dialogue", pause_after_ms=300),
         converter.AudioSegment(
-            "아무 일도 없었다. 다음 문장이다.",
+            "아무 일도 없었다.",
+            kind="narration",
+            pause_after_ms=300,
+        ),
+        converter.AudioSegment(
+            "다음 문장이다.",
             kind="narration",
             pause_after_ms=600,
         ),
@@ -451,9 +466,30 @@ def test_build_audio_segments_compacts_adjacent_dialogue_only_with_dialogue():
     )
 
     assert segments == [
-        converter.AudioSegment("“불.” “물.”", kind="dialogue", pause_after_ms=300),
+        converter.AudioSegment("“불.”", kind="dialogue", pause_after_ms=300),
+        converter.AudioSegment("“물.”", kind="dialogue", pause_after_ms=300),
         converter.AudioSegment("그는 숨을 골랐다.", kind="narration", pause_after_ms=300),
         converter.AudioSegment("“바람.”", kind="dialogue", pause_after_ms=600),
+    ]
+
+
+def test_build_audio_segments_compacts_only_when_no_pause_would_be_lost():
+    segments = converter._compact_audio_segments(
+        [
+            converter.AudioSegment("first", kind="narration", pause_after_ms=0),
+            converter.AudioSegment("second", kind="narration", pause_after_ms=300),
+            converter.AudioSegment("third", kind="narration", pause_after_ms=0),
+        ],
+        max_chars=120,
+    )
+
+    assert segments == [
+        converter.AudioSegment(
+            "first second",
+            kind="narration",
+            pause_after_ms=300,
+        ),
+        converter.AudioSegment("third", kind="narration", pause_after_ms=0),
     ]
 
 

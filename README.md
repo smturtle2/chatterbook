@@ -32,11 +32,9 @@ as `Title.m4b` in the current directory. You can also pass a path or directory.
 omitted, Chatterbox's bundled default conditionals are used.
 
 Chapters are split into paragraph and speech segments when the `Book` is built.
-Adjacent narration or dialogue sentences are compacted up to `max_chars` so TTS
-uses fewer calls while still keeping narration/dialogue boundaries. Quoted
-dialogue is marked separately and generated with slightly more expressive
+Quoted dialogue is marked separately and generated with slightly more expressive
 settings. Commas, sentence endings, paragraph breaks, and narration/dialogue
-transitions add short pauses to improve audiobook pacing.
+transitions add real silence after each segment to improve audiobook pacing.
 
 The default audiobook pacing is intentionally slower than raw TTS:
 

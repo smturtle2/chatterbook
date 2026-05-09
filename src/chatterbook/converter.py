@@ -746,7 +746,11 @@ def _compact_audio_segments(
             continue
 
         combined_text = f"{current.text} {segment.text}"
-        if current.kind == segment.kind and len(combined_text) <= max_chars:
+        if (
+            current.kind == segment.kind
+            and current.pause_after_ms == 0
+            and len(combined_text) <= max_chars
+        ):
             current = AudioSegment(
                 text=combined_text,
                 kind=current.kind,
