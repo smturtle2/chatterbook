@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-from pathlib import Path
-from types import SimpleNamespace
 import logging
 import sys
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 import chatterbook.converter as converter
-from chatterbook import convert_epub
+from chatterbook import Book
 
 
 @pytest.fixture(autouse=True)
@@ -44,35 +44,130 @@ class FakeTorchaudio:
         Path(path).write_bytes(b"wav")
 
 
-def test_convert_epub_passes_voice_path_and_style(monkeypatch, tmp_path):
-    fake_model = FakeModel()
-    fake_torchaudio = FakeTorchaudio()
-    voice_path = tmp_path / "voice.wav"
-    voice_path.write_bytes(b"voice")
+def fake_book_dict() -> dict:
+    return {
+        "schema_version": 1,
+        "title": "테스트 책",
+        "source_path": None,
+        "max_chars": 300,
+        "pause_defaults": {
+            "comma_pause_ms": 120,
+            "sentence_pause_ms": 300,
+            "paragraph_pause_ms": 600,
+            "dialogue_pause_ms": 300,
+        },
+        "chapters": [
+            {
+                "index": 1,
+                "title": "Intro",
+                "filename": "001-intro.wav",
+                "paragraphs": [
+                    {
+                        "index": 1,
+                        "text": "hello",
+                        "segments": [
+                            {
+                                "text": "hello",
+                                "kind": "narration",
+                                "pause_after_ms": 600,
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                "index": 2,
+                "title": "Next",
+                "filename": "002-next.wav",
+                "paragraphs": [
+                    {
+                        "index": 1,
+                        "text": "world",
+                        "segments": [
+                            {
+                                "text": "world",
+                                "kind": "narration",
+                                "pause_after_ms": 600,
+                            }
+                        ],
+                    }
+                ],
+            },
+        ],
+    }
 
+
+def test_book_serializes_paragraphs_dialogue_and_pauses(monkeypatch, tmp_path):
     monkeypatch.setattr(
         converter,
         "extract_chapters",
         lambda _: [
             SimpleNamespace(
                 title="Intro",
-                text="hello",
-                blocks=["hello"],
+                text="ignored",
+                blocks=[
+                    "렌은 말했다, “불.” 아무 일도 없었다.",
+                    "다음 문단이다.",
+                ],
                 filename="001-intro.wav",
-            ),
-            SimpleNamespace(
-                title="Next",
-                text="world",
-                blocks=["world"],
-                filename="002-next.wav",
-            ),
+            )
         ],
     )
+
+    book = Book(tmp_path / "book.epub")
+    data = book.to_dict()
+
+    assert data["schema_version"] == 1
+    assert data["title"] == "테스트 책"
+    assert data["chapters"][0]["title"] == "Intro"
+    assert data["chapters"][0]["paragraphs"][0]["segments"] == [
+        {"text": "렌은 말했다,", "kind": "narration", "pause_after_ms": 300},
+        {"text": "“불.”", "kind": "dialogue", "pause_after_ms": 300},
+        {"text": "아무 일도 없었다.", "kind": "narration", "pause_after_ms": 600},
+    ]
+    assert data["chapters"][0]["paragraphs"][1]["segments"] == [
+        {"text": "다음 문단이다.", "kind": "narration", "pause_after_ms": 600}
+    ]
+
+
+def test_book_round_trips_from_dict():
+    data = fake_book_dict()
+
+    assert Book.from_dict(data).to_dict() == data
+
+
+def test_straight_apostrophe_does_not_create_dialogue(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        converter,
+        "extract_chapters",
+        lambda _: [
+            SimpleNamespace(
+                title="Intro",
+                text="ignored",
+                blocks=["I'm here."],
+                filename="001-intro.wav",
+            )
+        ],
+    )
+
+    book = Book(tmp_path / "book.epub")
+    segments = book.to_dict()["chapters"][0]["paragraphs"][0]["segments"]
+
+    assert segments == [
+        {"text": "I'm here.", "kind": "narration", "pause_after_ms": 600}
+    ]
+
+
+def test_book_convert_passes_voice_path_and_style(monkeypatch, tmp_path):
+    fake_model = FakeModel()
+    fake_torchaudio = FakeTorchaudio()
+    voice_path = tmp_path / "voice.wav"
+    voice_path.write_bytes(b"voice")
+
     monkeypatch.setattr(converter, "_load_model", lambda **_: fake_model)
     monkeypatch.setattr(converter, "_import_torchaudio", lambda: fake_torchaudio)
 
-    paths = convert_epub(
-        tmp_path / "book.epub",
+    paths = Book.from_dict(fake_book_dict()).convert(
         tmp_path / "audio",
         language="ko",
         voice_path=voice_path,
@@ -91,23 +186,10 @@ def test_convert_epub_passes_voice_path_and_style(monkeypatch, tmp_path):
 
 def test_explicit_generation_values_override_style(monkeypatch, tmp_path):
     fake_model = FakeModel()
-    monkeypatch.setattr(
-        converter,
-        "extract_chapters",
-        lambda _: [
-            SimpleNamespace(
-                title="Intro",
-                text="hello",
-                blocks=["hello"],
-                filename="001-intro.wav",
-            )
-        ],
-    )
     monkeypatch.setattr(converter, "_load_model", lambda **_: fake_model)
     monkeypatch.setattr(converter, "_import_torchaudio", lambda: FakeTorchaudio())
 
-    convert_epub(
-        tmp_path / "book.epub",
+    Book.from_dict(fake_book_dict()).convert(
         tmp_path / "audio",
         language="en",
         style="dramatic",
@@ -122,10 +204,9 @@ def test_explicit_generation_values_override_style(monkeypatch, tmp_path):
     assert call["cfg_weight"] == 0.3
 
 
-def test_convert_epub_rejects_missing_voice_path(tmp_path):
+def test_book_convert_rejects_missing_voice_path(tmp_path):
     with pytest.raises(FileNotFoundError):
-        convert_epub(
-            tmp_path / "book.epub",
+        Book.from_dict(fake_book_dict()).convert(
             tmp_path / "audio",
             language="ko",
             output_format="wav",
@@ -134,26 +215,13 @@ def test_convert_epub_rejects_missing_voice_path(tmp_path):
         )
 
 
-def test_convert_epub_rejects_existing_output(monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        converter,
-        "extract_chapters",
-        lambda _: [
-            SimpleNamespace(
-                title="Intro",
-                text="hello",
-                blocks=["hello"],
-                filename="001-intro.wav",
-            )
-        ],
-    )
+def test_book_convert_rejects_existing_output(tmp_path):
     output_dir = tmp_path / "audio"
     output_dir.mkdir()
     (output_dir / "001-intro.wav").write_bytes(b"exists")
 
     with pytest.raises(FileExistsError):
-        convert_epub(
-            tmp_path / "book.epub",
+        Book.from_dict(fake_book_dict()).convert(
             output_dir,
             language="ko",
             output_format="wav",
@@ -161,55 +229,12 @@ def test_convert_epub_rejects_existing_output(monkeypatch, tmp_path):
         )
 
 
-def test_convert_epub_splits_long_chapters(monkeypatch, tmp_path):
-    fake_model = FakeModel()
-    monkeypatch.setattr(
-        converter,
-        "extract_chapters",
-        lambda _: [
-            SimpleNamespace(
-                title="Intro",
-                text="문장입니다. " * 80,
-                blocks=["문장입니다. " * 80],
-                filename="001-intro.wav",
-            )
-        ],
-    )
-    monkeypatch.setattr(converter, "_load_model", lambda **_: fake_model)
-    monkeypatch.setattr(converter, "_import_torchaudio", lambda: FakeTorchaudio())
-
-    convert_epub(
-        tmp_path / "book.epub",
-        tmp_path / "audio",
-        language="ko",
-        output_format="wav",
-        speed=1.0,
-        max_chars=120,
-    )
-
-    assert len(fake_model.calls) > 1
-    assert all(len(text) <= 120 for text, _ in fake_model.calls)
-
-
-def test_convert_epub_reports_generation_context(monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        converter,
-        "extract_chapters",
-        lambda _: [
-            SimpleNamespace(
-                title="Intro",
-                text="hello",
-                blocks=["문제가 나는 문장입니다."],
-                filename="001-intro.wav",
-            )
-        ],
-    )
+def test_book_convert_reports_generation_context(monkeypatch, tmp_path):
     monkeypatch.setattr(converter, "_load_model", lambda **_: FailingModel())
     monkeypatch.setattr(converter, "_import_torchaudio", lambda: FakeTorchaudio())
 
     with pytest.raises(converter.GenerationError) as exc_info:
-        convert_epub(
-            tmp_path / "book.epub",
+        Book.from_dict(fake_book_dict()).convert(
             tmp_path / "audio",
             language="ko",
             output_format="wav",
@@ -218,29 +243,16 @@ def test_convert_epub_reports_generation_context(monkeypatch, tmp_path):
 
     message = str(exc_info.value)
     assert "Intro" in message
-    assert "문제가 나는 문장입니다." in message
+    assert "hello" in message
 
 
-def test_convert_epub_defaults_m4b_name_from_epub_title(monkeypatch, tmp_path):
+def test_book_convert_defaults_m4b_name_from_title(monkeypatch, tmp_path):
     fake_model = FakeModel()
-    fake_torchaudio = FakeTorchaudio()
     commands = []
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(
-        converter,
-        "extract_chapters",
-        lambda _: [
-            SimpleNamespace(
-                title="제1장",
-                text="hello",
-                blocks=["hello"],
-                filename="001-1.wav",
-            )
-        ],
-    )
     monkeypatch.setattr(converter, "_load_model", lambda **_: fake_model)
-    monkeypatch.setattr(converter, "_import_torchaudio", lambda: fake_torchaudio)
+    monkeypatch.setattr(converter, "_import_torchaudio", lambda: FakeTorchaudio())
 
     def fake_run(command, **kwargs):
         commands.append(command)
@@ -249,28 +261,15 @@ def test_convert_epub_defaults_m4b_name_from_epub_title(monkeypatch, tmp_path):
 
     monkeypatch.setattr(converter.subprocess, "run", fake_run)
 
-    path = convert_epub(tmp_path / "book.epub", language="ko")
+    path = Book.from_dict(fake_book_dict()).convert(language="ko")
 
     assert path == tmp_path / "테스트 책.m4b"
     assert path.read_bytes() == b"m4b"
     assert commands[0][-1] == str(path)
 
 
-def test_convert_epub_m4b_uses_output_directory(monkeypatch, tmp_path):
-    fake_model = FakeModel()
-    monkeypatch.setattr(
-        converter,
-        "extract_chapters",
-        lambda _: [
-            SimpleNamespace(
-                title="제1장",
-                text="hello",
-                blocks=["hello"],
-                filename="001-1.wav",
-            )
-        ],
-    )
-    monkeypatch.setattr(converter, "_load_model", lambda **_: fake_model)
+def test_book_convert_m4b_uses_output_directory(monkeypatch, tmp_path):
+    monkeypatch.setattr(converter, "_load_model", lambda **_: FakeModel())
     monkeypatch.setattr(converter, "_import_torchaudio", lambda: FakeTorchaudio())
     monkeypatch.setattr(
         converter.subprocess,
@@ -279,7 +278,7 @@ def test_convert_epub_m4b_uses_output_directory(monkeypatch, tmp_path):
     )
 
     output_dir = tmp_path / "out"
-    path = convert_epub(tmp_path / "book.epub", output_dir, language="ko")
+    path = Book.from_dict(fake_book_dict()).convert(output_dir, language="ko")
 
     assert path == output_dir / "테스트 책.m4b"
 
@@ -299,27 +298,19 @@ def test_build_ffmetadata_preserves_chapter_titles():
     assert "title=제2장 \\# 끝" in metadata
 
 
-def test_build_audio_segments_preserves_paragraphs_and_dialogue():
+def test_build_audio_segments_splits_sentences_and_oversized_chunks():
     segments = converter._build_audio_segments(
-        [
-            "렌은 말했다. “불.” 아무 일도 일어나지 않았다.",
-            "다음 문단이다.",
-        ],
-        max_chars=300,
+        ["첫 문장입니다. " + ("긴문장 " * 30)],
+        max_chars=120,
         paragraph_pause_ms=600,
-        dialogue_pause_ms=300,
     )
 
-    assert segments == [
-        converter.AudioSegment("렌은 말했다.", is_dialogue=False, pause_after_ms=300),
-        converter.AudioSegment("“불.”", is_dialogue=True, pause_after_ms=300),
-        converter.AudioSegment(
-            "아무 일도 일어나지 않았다.",
-            is_dialogue=False,
-            pause_after_ms=600,
-        ),
-        converter.AudioSegment("다음 문단이다.", is_dialogue=False, pause_after_ms=600),
-    ]
+    assert segments[0] == converter.AudioSegment(
+        "첫 문장입니다.", kind="narration", pause_after_ms=300
+    )
+    assert len(segments) > 1
+    assert all(len(segment.text) <= 120 for segment in segments)
+    assert segments[-1].pause_after_ms == 600
 
 
 def test_silence_matches_reference_tensor():
@@ -361,7 +352,7 @@ def test_run_ffmpeg_m4b_adds_tempo_filter(monkeypatch, tmp_path):
     assert "atempo=0.9" in commands[0]
 
 
-def test_epub_progress_uses_single_total_bar(monkeypatch):
+def test_book_progress_uses_single_total_bar(monkeypatch):
     calls = []
 
     class FakeTqdm:
@@ -373,25 +364,19 @@ def test_epub_progress_uses_single_total_bar(monkeypatch):
         "tqdm.auto",
         SimpleNamespace(tqdm=FakeTqdm),
     )
-    chapters = [
-        SimpleNamespace(blocks=["a", "b"]),
-        SimpleNamespace(blocks=["c " * 80]),
-    ]
 
-    progress = converter._epub_progress(
-        chapters,
-        max_chars=120,
-        paragraph_pause_ms=600,
-        dialogue_pause_ms=300,
+    progress = converter._book_progress(
+        Book.from_dict(fake_book_dict()),
         enabled=True,
+        output_format="m4b",
     )
 
     assert isinstance(progress, FakeTqdm)
     assert len(calls) == 1
-    assert calls[0]["desc"] == "EPUB"
-    assert calls[0]["unit"] == "chunk"
+    assert calls[0]["desc"] == "EPUB -> M4B"
+    assert calls[0]["unit"] == "segment"
     assert calls[0]["colour"] == "green"
-    assert calls[0]["total"] == 4
+    assert calls[0]["total"] == 2
 
 
 def test_pkg_resources_shim_supports_resource_filename(monkeypatch):

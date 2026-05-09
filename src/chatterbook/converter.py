@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import logging
+import re
 import shutil
 import subprocess
 import tempfile
 from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
-import logging
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -13,6 +13,13 @@ from typing import Any, Literal
 from .epub import extract_chapters, get_book_title
 from .exceptions import GenerationError, OutputExistsError, UnsupportedLanguageError
 from .styles import resolve_style
+
+SCHEMA_VERSION = 1
+DEFAULT_MAX_CHARS = 300
+DEFAULT_COMMA_PAUSE_MS = 120
+DEFAULT_SENTENCE_PAUSE_MS = 300
+DEFAULT_PARAGRAPH_PAUSE_MS = 600
+DEFAULT_DIALOGUE_PAUSE_MS = 300
 
 SUPPORTED_LANGUAGES = {
     "ar",
@@ -44,65 +51,240 @@ SUPPORTED_LANGUAGES = {
 @dataclass(frozen=True)
 class AudioSegment:
     text: str
-    is_dialogue: bool = False
+    kind: Literal["narration", "dialogue"] = "narration"
     pause_after_ms: int = 0
 
+    @property
+    def is_dialogue(self) -> bool:
+        return self.kind == "dialogue"
 
-def convert_epub(
-    epub_path: str | Path,
-    output_path: str | Path | None = None,
-    *,
-    language: str,
-    voice_path: str | Path | None = None,
-    style: str = "neutral",
-    output_format: Literal["m4b", "wav"] = "m4b",
-    bitrate: str = "128k",
-    keep_temp: bool = False,
-    show_progress: bool = True,
-    device: str | None = None,
-    t3_model: str | None = None,
-    overwrite: bool = False,
-    max_chars: int = 300,
-    speed: float = 0.9,
-    paragraph_pause_ms: int = 600,
-    dialogue_pause_ms: int = 300,
-    exaggeration: float | None = None,
-    cfg_weight: float | None = None,
-    dialogue_exaggeration: float = 0.7,
-    dialogue_cfg_weight: float = 0.45,
-    temperature: float = 0.8,
-    repetition_penalty: float = 1.2,
-    min_p: float = 0.05,
-    top_p: float = 1.0,
-) -> Path | list[Path]:
-    """Convert an EPUB into an M4B audiobook or chapter WAV files.
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "text": self.text,
+            "kind": self.kind,
+            "pause_after_ms": self.pause_after_ms,
+        }
 
-    The Chatterbox model is loaded lazily so importing chatterbook stays cheap.
-    """
-    language_id = language.lower()
-    if language_id not in SUPPORTED_LANGUAGES:
-        raise UnsupportedLanguageError(language, sorted(SUPPORTED_LANGUAGES))
-    if speed <= 0:
-        raise ValueError("speed must be greater than 0")
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> AudioSegment:
+        return cls(
+            text=str(data["text"]),
+            kind=_segment_kind(data.get("kind", "narration")),
+            pause_after_ms=int(data.get("pause_after_ms", 0)),
+        )
 
-    epub_path = Path(epub_path)
-    book_title = get_book_title(epub_path)
-    output = _resolve_output_path(
-        output_path,
-        output_format=output_format,
-        book_title=book_title,
-    )
-    voice_prompt_path = _resolve_voice_path(voice_path)
-    generation_style = resolve_style(
-        style,
-        exaggeration=exaggeration,
-        cfg_weight=cfg_weight,
-    )
 
-    chapters = extract_chapters(epub_path)
-    if output_format == "wav":
-        return _convert_epub_to_wavs(
-            chapters,
+@dataclass(frozen=True)
+class BookParagraph:
+    index: int
+    text: str
+    segments: list[AudioSegment]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "index": self.index,
+            "text": self.text,
+            "segments": [segment.to_dict() for segment in self.segments],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> BookParagraph:
+        return cls(
+            index=int(data["index"]),
+            text=str(data["text"]),
+            segments=[
+                AudioSegment.from_dict(segment)
+                for segment in data.get("segments", data.get("sentences", []))
+            ],
+        )
+
+
+@dataclass(frozen=True)
+class BookChapter:
+    index: int
+    title: str
+    filename: str
+    paragraphs: list[BookParagraph]
+
+    @property
+    def segments(self) -> list[AudioSegment]:
+        return [
+            segment
+            for paragraph in self.paragraphs
+            for segment in paragraph.segments
+        ]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "index": self.index,
+            "title": self.title,
+            "filename": self.filename,
+            "paragraphs": [paragraph.to_dict() for paragraph in self.paragraphs],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> BookChapter:
+        return cls(
+            index=int(data["index"]),
+            title=str(data["title"]),
+            filename=str(data["filename"]),
+            paragraphs=[
+                BookParagraph.from_dict(paragraph)
+                for paragraph in data.get("paragraphs", [])
+            ],
+        )
+
+
+class Book:
+    """Serializable EPUB book representation ready for TTS conversion."""
+
+    def __init__(
+        self,
+        epub_path: str | Path,
+        *,
+        max_chars: int = DEFAULT_MAX_CHARS,
+        comma_pause_ms: int = DEFAULT_COMMA_PAUSE_MS,
+        sentence_pause_ms: int = DEFAULT_SENTENCE_PAUSE_MS,
+        paragraph_pause_ms: int = DEFAULT_PARAGRAPH_PAUSE_MS,
+        dialogue_pause_ms: int = DEFAULT_DIALOGUE_PAUSE_MS,
+    ) -> None:
+        _validate_pause_values(
+            comma_pause_ms=comma_pause_ms,
+            sentence_pause_ms=sentence_pause_ms,
+            paragraph_pause_ms=paragraph_pause_ms,
+            dialogue_pause_ms=dialogue_pause_ms,
+        )
+        if max_chars < 100:
+            raise ValueError("max_chars must be at least 100")
+
+        self.source_path = Path(epub_path)
+        self.title = get_book_title(self.source_path)
+        self.max_chars = max_chars
+        self.comma_pause_ms = comma_pause_ms
+        self.sentence_pause_ms = sentence_pause_ms
+        self.paragraph_pause_ms = paragraph_pause_ms
+        self.dialogue_pause_ms = dialogue_pause_ms
+        self.chapters = _build_book_chapters(
+            extract_chapters(self.source_path),
+            max_chars=max_chars,
+            comma_pause_ms=comma_pause_ms,
+            sentence_pause_ms=sentence_pause_ms,
+            paragraph_pause_ms=paragraph_pause_ms,
+            dialogue_pause_ms=dialogue_pause_ms,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "title": self.title,
+            "source_path": str(self.source_path) if self.source_path else None,
+            "max_chars": self.max_chars,
+            "pause_defaults": {
+                "comma_pause_ms": self.comma_pause_ms,
+                "sentence_pause_ms": self.sentence_pause_ms,
+                "paragraph_pause_ms": self.paragraph_pause_ms,
+                "dialogue_pause_ms": self.dialogue_pause_ms,
+            },
+            "chapters": [chapter.to_dict() for chapter in self.chapters],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Book:
+        schema_version = int(data.get("schema_version", 0))
+        if schema_version != SCHEMA_VERSION:
+            raise ValueError(f"Unsupported book schema version: {schema_version}")
+
+        pause_defaults = data.get("pause_defaults", {})
+        book = cls.__new__(cls)
+        book.source_path = (
+            Path(data["source_path"]) if data.get("source_path") is not None else None
+        )
+        book.title = str(data["title"])
+        book.max_chars = int(data.get("max_chars", DEFAULT_MAX_CHARS))
+        book.comma_pause_ms = int(
+            pause_defaults.get("comma_pause_ms", DEFAULT_COMMA_PAUSE_MS)
+        )
+        book.sentence_pause_ms = int(
+            pause_defaults.get("sentence_pause_ms", DEFAULT_SENTENCE_PAUSE_MS)
+        )
+        book.paragraph_pause_ms = int(
+            pause_defaults.get("paragraph_pause_ms", DEFAULT_PARAGRAPH_PAUSE_MS)
+        )
+        book.dialogue_pause_ms = int(
+            pause_defaults.get("dialogue_pause_ms", DEFAULT_DIALOGUE_PAUSE_MS)
+        )
+        book.chapters = [
+            BookChapter.from_dict(chapter) for chapter in data.get("chapters", [])
+        ]
+        return book
+
+    def convert(
+        self,
+        output_path: str | Path | None = None,
+        *,
+        language: str,
+        voice_path: str | Path | None = None,
+        style: str = "neutral",
+        output_format: Literal["m4b", "wav"] = "m4b",
+        bitrate: str = "128k",
+        keep_temp: bool = False,
+        show_progress: bool = True,
+        device: str | None = None,
+        t3_model: str | None = None,
+        overwrite: bool = False,
+        speed: float = 0.9,
+        exaggeration: float | None = None,
+        cfg_weight: float | None = None,
+        dialogue_exaggeration: float = 0.7,
+        dialogue_cfg_weight: float = 0.45,
+        temperature: float = 0.8,
+        repetition_penalty: float = 1.2,
+        min_p: float = 0.05,
+        top_p: float = 1.0,
+    ) -> Path | list[Path]:
+        language_id = language.lower()
+        if language_id not in SUPPORTED_LANGUAGES:
+            raise UnsupportedLanguageError(language, sorted(SUPPORTED_LANGUAGES))
+        if speed <= 0:
+            raise ValueError("speed must be greater than 0")
+
+        output = _resolve_output_path(
+            output_path,
+            output_format=output_format,
+            book_title=self.title,
+        )
+        voice_prompt_path = _resolve_voice_path(voice_path)
+        generation_style = resolve_style(
+            style,
+            exaggeration=exaggeration,
+            cfg_weight=cfg_weight,
+        )
+
+        if output_format == "wav":
+            return _convert_book_to_wavs(
+                self,
+                output,
+                language_id=language_id,
+                voice_prompt_path=voice_prompt_path,
+                generation_style=generation_style,
+                device=device,
+                t3_model=t3_model,
+                overwrite=overwrite,
+                speed=speed,
+                dialogue_exaggeration=dialogue_exaggeration,
+                dialogue_cfg_weight=dialogue_cfg_weight,
+                show_progress=show_progress,
+                temperature=temperature,
+                repetition_penalty=repetition_penalty,
+                min_p=min_p,
+                top_p=top_p,
+            )
+
+        if output_format != "m4b":
+            raise ValueError("output_format must be 'm4b' or 'wav'")
+
+        return _convert_book_to_m4b(
+            self,
             output,
             language_id=language_id,
             voice_prompt_path=voice_prompt_path,
@@ -110,10 +292,9 @@ def convert_epub(
             device=device,
             t3_model=t3_model,
             overwrite=overwrite,
-            max_chars=max_chars,
+            bitrate=bitrate,
+            keep_temp=keep_temp,
             speed=speed,
-            paragraph_pause_ms=paragraph_pause_ms,
-            dialogue_pause_ms=dialogue_pause_ms,
             dialogue_exaggeration=dialogue_exaggeration,
             dialogue_cfg_weight=dialogue_cfg_weight,
             show_progress=show_progress,
@@ -123,37 +304,50 @@ def convert_epub(
             top_p=top_p,
         )
 
-    if output_format != "m4b":
-        raise ValueError("output_format must be 'm4b' or 'wav'")
 
-    return _convert_epub_to_m4b(
-        chapters,
-        output,
-        book_title=book_title,
-        language_id=language_id,
-        voice_prompt_path=voice_prompt_path,
-        generation_style=generation_style,
-        device=device,
-        t3_model=t3_model,
-        overwrite=overwrite,
-        max_chars=max_chars,
-        bitrate=bitrate,
-        keep_temp=keep_temp,
-        speed=speed,
-        paragraph_pause_ms=paragraph_pause_ms,
-        dialogue_pause_ms=dialogue_pause_ms,
-        dialogue_exaggeration=dialogue_exaggeration,
-        dialogue_cfg_weight=dialogue_cfg_weight,
-        show_progress=show_progress,
-        temperature=temperature,
-        repetition_penalty=repetition_penalty,
-        min_p=min_p,
-        top_p=top_p,
-    )
-
-
-def _convert_epub_to_wavs(
+def _build_book_chapters(
     chapters: list[Any],
+    *,
+    max_chars: int,
+    comma_pause_ms: int,
+    sentence_pause_ms: int,
+    paragraph_pause_ms: int,
+    dialogue_pause_ms: int,
+) -> list[BookChapter]:
+    book_chapters = []
+    for chapter_index, chapter in enumerate(chapters, start=1):
+        paragraphs = []
+        for paragraph_index, block in enumerate(chapter.blocks, start=1):
+            text = " ".join(block.split())
+            if not text:
+                continue
+            paragraphs.append(
+                BookParagraph(
+                    index=paragraph_index,
+                    text=text,
+                    segments=_build_audio_segments(
+                        [text],
+                        max_chars=max_chars,
+                        comma_pause_ms=comma_pause_ms,
+                        sentence_pause_ms=sentence_pause_ms,
+                        paragraph_pause_ms=paragraph_pause_ms,
+                        dialogue_pause_ms=dialogue_pause_ms,
+                    ),
+                )
+            )
+        book_chapters.append(
+            BookChapter(
+                index=chapter_index,
+                title=chapter.title,
+                filename=chapter.filename,
+                paragraphs=paragraphs,
+            )
+        )
+    return book_chapters
+
+
+def _convert_book_to_wavs(
+    book: Book,
     output_dir: Path,
     *,
     language_id: str,
@@ -162,10 +356,7 @@ def _convert_epub_to_wavs(
     device: str | None,
     t3_model: str | None,
     overwrite: bool,
-    max_chars: int,
     speed: float,
-    paragraph_pause_ms: int,
-    dialogue_pause_ms: int,
     dialogue_exaggeration: float,
     dialogue_cfg_weight: float,
     show_progress: bool,
@@ -176,64 +367,38 @@ def _convert_epub_to_wavs(
 ) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    output_paths = [output_dir / chapter.filename for chapter in chapters]
+    output_paths = [output_dir / chapter.filename for chapter in book.chapters]
     existing_paths = [path for path in output_paths if path.exists()]
     if existing_paths and not overwrite:
         raise OutputExistsError(existing_paths)
 
     model = _load_model(device=device, t3_model=t3_model)
     torchaudio = _import_torchaudio()
-    progress = _epub_progress(
-        chapters,
-        max_chars=max_chars,
-        paragraph_pause_ms=paragraph_pause_ms,
-        dialogue_pause_ms=dialogue_pause_ms,
-        enabled=show_progress,
-    )
+    progress = _book_progress(book, enabled=show_progress, output_format="wav")
 
     written_paths: list[Path] = []
     try:
-        for chapter, output_path in zip(chapters, output_paths, strict=True):
-            wavs = []
-            segments = _build_audio_segments(
-                chapter.blocks,
-                max_chars=max_chars,
-                paragraph_pause_ms=paragraph_pause_ms,
-                dialogue_pause_ms=dialogue_pause_ms,
+        for chapter, output_path in zip(book.chapters, output_paths, strict=True):
+            wav, duration_ms = _render_chapter_wav(
+                chapter,
+                model,
+                language_id=language_id,
+                voice_prompt_path=voice_prompt_path,
+                generation_style=generation_style,
+                dialogue_exaggeration=dialogue_exaggeration,
+                dialogue_cfg_weight=dialogue_cfg_weight,
+                show_progress=show_progress,
+                progress=progress,
+                temperature=temperature,
+                repetition_penalty=repetition_penalty,
+                min_p=min_p,
+                top_p=top_p,
             )
-            for segment in segments:
-                try:
-                    wav = _generate_audio(
-                        model,
-                        segment.text,
-                        show_progress=show_progress,
-                        language_id=language_id,
-                        audio_prompt_path=str(voice_prompt_path)
-                        if voice_prompt_path
-                        else None,
-                        exaggeration=dialogue_exaggeration
-                        if segment.is_dialogue
-                        else generation_style.exaggeration,
-                        cfg_weight=dialogue_cfg_weight
-                        if segment.is_dialogue
-                        else generation_style.cfg_weight,
-                        temperature=temperature,
-                        repetition_penalty=repetition_penalty,
-                        min_p=min_p,
-                        top_p=top_p,
-                    )
-                except Exception as exc:
-                    raise GenerationError(chapter.title, segment.text) from exc
-                wavs.append(wav)
-                if segment.pause_after_ms:
-                    wavs.append(_silence(segment.pause_after_ms, model.sr, like=wav))
-                if progress is not None:
-                    progress.update(1)
-            wav = _concat_wavs(wavs)
             torchaudio.save(str(output_path), wav, model.sr)
             if speed != 1.0:
                 _run_ffmpeg_wav_speed(output_path, speed=speed)
             written_paths.append(output_path)
+            _ = duration_ms
     finally:
         if progress is not None:
             progress.close()
@@ -241,44 +406,19 @@ def _convert_epub_to_wavs(
     return written_paths
 
 
-def _resolve_output_path(
-    output_path: str | Path | None,
-    *,
-    output_format: str,
-    book_title: str,
-) -> Path:
-    if output_format not in {"m4b", "wav"}:
-        raise ValueError("output_format must be 'm4b' or 'wav'")
-
-    default_name = _safe_filename(book_title)
-    if output_path is None:
-        if output_format == "m4b":
-            return Path.cwd() / f"{default_name}.m4b"
-        return Path.cwd() / default_name
-
-    path = Path(output_path)
-    if output_format == "m4b" and (path.is_dir() or path.suffix == ""):
-        return path / f"{default_name}.m4b"
-    return path
-
-
-def _convert_epub_to_m4b(
-    chapters: list[Any],
+def _convert_book_to_m4b(
+    book: Book,
     output_path: Path,
     *,
-    book_title: str,
     language_id: str,
     voice_prompt_path: Path | None,
     generation_style: Any,
     device: str | None,
     t3_model: str | None,
     overwrite: bool,
-    max_chars: int,
     bitrate: str,
     keep_temp: bool,
     speed: float,
-    paragraph_pause_ms: int,
-    dialogue_pause_ms: int,
     dialogue_exaggeration: float,
     dialogue_cfg_weight: float,
     show_progress: bool,
@@ -306,16 +446,13 @@ def _convert_epub_to_m4b(
 
     try:
         chapter_paths, chapter_durations = _write_chapter_wavs(
-            chapters,
+            book,
             temp_dir,
             language_id=language_id,
             voice_prompt_path=voice_prompt_path,
             generation_style=generation_style,
             device=device,
             t3_model=t3_model,
-            max_chars=max_chars,
-            paragraph_pause_ms=paragraph_pause_ms,
-            dialogue_pause_ms=dialogue_pause_ms,
             dialogue_exaggeration=dialogue_exaggeration,
             dialogue_cfg_weight=dialogue_cfg_weight,
             show_progress=show_progress,
@@ -328,13 +465,15 @@ def _convert_epub_to_m4b(
         concat_path = temp_dir / "concat.txt"
         metadata_durations = _tempo_adjusted_durations(chapter_durations, speed=speed)
         metadata_path.write_text(
-            _build_ffmetadata(book_title, chapters, metadata_durations),
+            _build_ffmetadata(book.title, book.chapters, metadata_durations),
             encoding="utf-8",
         )
         concat_path.write_text(
             "".join(f"file '{_escape_concat_path(path)}'\n" for path in chapter_paths),
             encoding="utf-8",
         )
+        if show_progress:
+            print("Creating M4B with ffmpeg...")
         _run_ffmpeg_m4b(
             concat_path,
             metadata_path,
@@ -348,6 +487,356 @@ def _convert_epub_to_m4b(
             temp_context.cleanup()
 
     return output_path
+
+
+def _write_chapter_wavs(
+    book: Book,
+    output_dir: Path,
+    *,
+    language_id: str,
+    voice_prompt_path: Path | None,
+    generation_style: Any,
+    device: str | None,
+    t3_model: str | None,
+    dialogue_exaggeration: float,
+    dialogue_cfg_weight: float,
+    show_progress: bool,
+    temperature: float,
+    repetition_penalty: float,
+    min_p: float,
+    top_p: float,
+) -> tuple[list[Path], list[int]]:
+    model = _load_model(device=device, t3_model=t3_model)
+    torchaudio = _import_torchaudio()
+    chapter_paths: list[Path] = []
+    chapter_durations: list[int] = []
+    progress = _book_progress(book, enabled=show_progress, output_format="m4b")
+
+    try:
+        for chapter in book.chapters:
+            wav, duration_ms = _render_chapter_wav(
+                chapter,
+                model,
+                language_id=language_id,
+                voice_prompt_path=voice_prompt_path,
+                generation_style=generation_style,
+                dialogue_exaggeration=dialogue_exaggeration,
+                dialogue_cfg_weight=dialogue_cfg_weight,
+                show_progress=show_progress,
+                progress=progress,
+                temperature=temperature,
+                repetition_penalty=repetition_penalty,
+                min_p=min_p,
+                top_p=top_p,
+            )
+            output_path = output_dir / chapter.filename
+            torchaudio.save(str(output_path), wav, model.sr)
+            chapter_paths.append(output_path)
+            chapter_durations.append(duration_ms)
+    finally:
+        if progress is not None:
+            progress.close()
+
+    return chapter_paths, chapter_durations
+
+
+def _render_chapter_wav(
+    chapter: BookChapter,
+    model: Any,
+    *,
+    language_id: str,
+    voice_prompt_path: Path | None,
+    generation_style: Any,
+    dialogue_exaggeration: float,
+    dialogue_cfg_weight: float,
+    show_progress: bool,
+    progress: Any,
+    temperature: float,
+    repetition_penalty: float,
+    min_p: float,
+    top_p: float,
+) -> tuple[Any, int]:
+    wavs = []
+    for index, segment in enumerate(chapter.segments, start=1):
+        try:
+            wav = _generate_audio(
+                model,
+                segment.text,
+                show_progress=show_progress,
+                language_id=language_id,
+                audio_prompt_path=str(voice_prompt_path) if voice_prompt_path else None,
+                exaggeration=dialogue_exaggeration
+                if segment.is_dialogue
+                else generation_style.exaggeration,
+                cfg_weight=dialogue_cfg_weight
+                if segment.is_dialogue
+                else generation_style.cfg_weight,
+                temperature=temperature,
+                repetition_penalty=repetition_penalty,
+                min_p=min_p,
+                top_p=top_p,
+            )
+        except Exception as exc:
+            raise GenerationError(chapter.title, segment.text) from exc
+        wavs.append(wav)
+        if segment.pause_after_ms:
+            wavs.append(_silence(segment.pause_after_ms, model.sr, like=wav))
+        if progress is not None:
+            progress.set_postfix(
+                chapter=chapter.title[:24],
+                segment=f"{index}/{len(chapter.segments)}",
+                refresh=False,
+            )
+            progress.update(1)
+
+    wav = _concat_wavs(wavs)
+    return wav, _duration_ms(wav, model.sr)
+
+
+def _build_audio_segments(
+    blocks: list[str],
+    *,
+    max_chars: int,
+    comma_pause_ms: int = DEFAULT_COMMA_PAUSE_MS,
+    sentence_pause_ms: int = DEFAULT_SENTENCE_PAUSE_MS,
+    paragraph_pause_ms: int = DEFAULT_PARAGRAPH_PAUSE_MS,
+    dialogue_pause_ms: int = DEFAULT_DIALOGUE_PAUSE_MS,
+) -> list[AudioSegment]:
+    _validate_pause_values(
+        comma_pause_ms=comma_pause_ms,
+        sentence_pause_ms=sentence_pause_ms,
+        paragraph_pause_ms=paragraph_pause_ms,
+        dialogue_pause_ms=dialogue_pause_ms,
+    )
+    if max_chars < 100:
+        raise ValueError("max_chars must be at least 100")
+
+    segments: list[AudioSegment] = []
+    for block in blocks:
+        block = " ".join(block.split())
+        if not block:
+            continue
+
+        paragraph_segments = _split_dialogue(
+            block,
+            max_chars=max_chars,
+            comma_pause_ms=comma_pause_ms,
+            sentence_pause_ms=sentence_pause_ms,
+        )
+        if not paragraph_segments:
+            continue
+
+        start_index = len(segments)
+        for segment in paragraph_segments:
+            if segments and (segment.is_dialogue != segments[-1].is_dialogue):
+                previous = segments[-1]
+                segments[-1] = AudioSegment(
+                    text=previous.text,
+                    kind=previous.kind,
+                    pause_after_ms=max(previous.pause_after_ms, dialogue_pause_ms),
+                )
+            segments.append(segment)
+
+        last = segments[-1]
+        segments[-1] = AudioSegment(
+            text=last.text,
+            kind=last.kind,
+            pause_after_ms=max(last.pause_after_ms, paragraph_pause_ms),
+        )
+        if start_index < len(segments) - 1:
+            previous = segments[-2]
+            if previous.is_dialogue != last.is_dialogue:
+                segments[-2] = AudioSegment(
+                    text=previous.text,
+                    kind=previous.kind,
+                    pause_after_ms=max(previous.pause_after_ms, dialogue_pause_ms),
+                )
+
+    return segments
+
+
+def _split_dialogue(
+    text: str,
+    *,
+    max_chars: int,
+    comma_pause_ms: int,
+    sentence_pause_ms: int,
+) -> list[AudioSegment]:
+    quote_pairs = {
+        "“": "”",
+        '"': '"',
+        "‘": "’",
+    }
+    segments: list[AudioSegment] = []
+    index = 0
+
+    while index < len(text):
+        next_quote_index = -1
+        next_quote = ""
+        for quote in quote_pairs:
+            found = text.find(quote, index)
+            if found != -1 and (next_quote_index == -1 or found < next_quote_index):
+                next_quote_index = found
+                next_quote = quote
+
+        if next_quote_index == -1:
+            segments.extend(
+                _segments_from_text(
+                    text[index:],
+                    kind="narration",
+                    max_chars=max_chars,
+                    comma_pause_ms=comma_pause_ms,
+                    sentence_pause_ms=sentence_pause_ms,
+                )
+            )
+            break
+
+        segments.extend(
+            _segments_from_text(
+                text[index:next_quote_index],
+                kind="narration",
+                max_chars=max_chars,
+                comma_pause_ms=comma_pause_ms,
+                sentence_pause_ms=sentence_pause_ms,
+            )
+        )
+
+        closing_quote = quote_pairs[next_quote]
+        closing_index = text.find(closing_quote, next_quote_index + 1)
+        if closing_index == -1:
+            segments.extend(
+                _segments_from_text(
+                    text[next_quote_index:],
+                    kind="narration",
+                    max_chars=max_chars,
+                    comma_pause_ms=comma_pause_ms,
+                    sentence_pause_ms=sentence_pause_ms,
+                )
+            )
+            break
+
+        segments.extend(
+            _segments_from_text(
+                text[next_quote_index : closing_index + 1],
+                kind="dialogue",
+                max_chars=max_chars,
+                comma_pause_ms=comma_pause_ms,
+                sentence_pause_ms=sentence_pause_ms,
+            )
+        )
+        index = closing_index + 1
+
+    return [segment for segment in segments if segment.text]
+
+
+def _segments_from_text(
+    text: str,
+    *,
+    kind: Literal["narration", "dialogue"],
+    max_chars: int,
+    comma_pause_ms: int,
+    sentence_pause_ms: int,
+) -> list[AudioSegment]:
+    text = " ".join(text.split())
+    if not text:
+        return []
+
+    segments: list[AudioSegment] = []
+    for sentence in _split_sentences(text):
+        pause_after_ms = _punctuation_pause(
+            sentence,
+            comma_pause_ms=comma_pause_ms,
+            sentence_pause_ms=sentence_pause_ms,
+        )
+        chunks = _split_oversized(sentence, max_chars=max_chars)
+        for chunk in chunks[:-1]:
+            segments.append(AudioSegment(text=chunk, kind=kind, pause_after_ms=0))
+        segments.append(
+            AudioSegment(text=chunks[-1], kind=kind, pause_after_ms=pause_after_ms)
+        )
+    return segments
+
+
+def _split_sentences(text: str) -> list[str]:
+    sentence_endings = ".?!。！？"
+    parts: list[str] = []
+    start = 0
+    for index, char in enumerate(text):
+        if char not in sentence_endings:
+            continue
+        end = index + 1
+        while end < len(text) and text[end] in '"”’':
+            end += 1
+        part = text[start:end].strip()
+        if part:
+            parts.append(part)
+        start = end
+
+    tail = text[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _punctuation_pause(
+    text: str,
+    *,
+    comma_pause_ms: int,
+    sentence_pause_ms: int,
+) -> int:
+    stripped = text.rstrip('"”’')
+    if not stripped:
+        return 0
+    if stripped[-1] in ".?!。！？":
+        return sentence_pause_ms
+    if stripped[-1] in ",，、;；:":
+        return comma_pause_ms
+    return 0
+
+
+def _validate_pause_values(
+    *,
+    comma_pause_ms: int,
+    sentence_pause_ms: int,
+    paragraph_pause_ms: int,
+    dialogue_pause_ms: int,
+) -> None:
+    values = {
+        "comma_pause_ms": comma_pause_ms,
+        "sentence_pause_ms": sentence_pause_ms,
+        "paragraph_pause_ms": paragraph_pause_ms,
+        "dialogue_pause_ms": dialogue_pause_ms,
+    }
+    for name, value in values.items():
+        if value < 0:
+            raise ValueError(f"{name} must be non-negative")
+
+
+def _segment_kind(value: Any) -> Literal["narration", "dialogue"]:
+    if value not in {"narration", "dialogue"}:
+        raise ValueError(f"Unknown segment kind: {value}")
+    return value
+
+
+def _resolve_output_path(
+    output_path: str | Path | None,
+    *,
+    output_format: str,
+    book_title: str,
+) -> Path:
+    if output_format not in {"m4b", "wav"}:
+        raise ValueError("output_format must be 'm4b' or 'wav'")
+
+    default_name = _safe_filename(book_title)
+    if output_path is None:
+        if output_format == "m4b":
+            return Path.cwd() / f"{default_name}.m4b"
+        return Path.cwd() / default_name
+
+    path = Path(output_path)
+    if output_format == "m4b" and (path.is_dir() or path.suffix == ""):
+        return path / f"{default_name}.m4b"
+    return path
 
 
 def _duration_ms(wav: Any, sample_rate: int) -> int:
@@ -437,88 +926,6 @@ def _run_ffmpeg_m4b(
         raise RuntimeError(f"ffmpeg failed to create M4B: {detail}") from exc
 
 
-def _write_chapter_wavs(
-    chapters: list[Any],
-    output_dir: Path,
-    *,
-    language_id: str,
-    voice_prompt_path: Path | None,
-    generation_style: Any,
-    device: str | None,
-    t3_model: str | None,
-    max_chars: int,
-    paragraph_pause_ms: int,
-    dialogue_pause_ms: int,
-    dialogue_exaggeration: float,
-    dialogue_cfg_weight: float,
-    show_progress: bool,
-    temperature: float,
-    repetition_penalty: float,
-    min_p: float,
-    top_p: float,
-) -> tuple[list[Path], list[int]]:
-    model = _load_model(device=device, t3_model=t3_model)
-    torchaudio = _import_torchaudio()
-    chapter_paths: list[Path] = []
-    chapter_durations: list[int] = []
-    progress = _epub_progress(
-        chapters,
-        max_chars=max_chars,
-        paragraph_pause_ms=paragraph_pause_ms,
-        dialogue_pause_ms=dialogue_pause_ms,
-        enabled=show_progress,
-    )
-
-    try:
-        for chapter in chapters:
-            wavs = []
-            segments = _build_audio_segments(
-                chapter.blocks,
-                max_chars=max_chars,
-                paragraph_pause_ms=paragraph_pause_ms,
-                dialogue_pause_ms=dialogue_pause_ms,
-            )
-            for segment in segments:
-                try:
-                    wav = _generate_audio(
-                        model,
-                        segment.text,
-                        show_progress=show_progress,
-                        language_id=language_id,
-                        audio_prompt_path=str(voice_prompt_path)
-                        if voice_prompt_path
-                        else None,
-                        exaggeration=dialogue_exaggeration
-                        if segment.is_dialogue
-                        else generation_style.exaggeration,
-                        cfg_weight=dialogue_cfg_weight
-                        if segment.is_dialogue
-                        else generation_style.cfg_weight,
-                        temperature=temperature,
-                        repetition_penalty=repetition_penalty,
-                        min_p=min_p,
-                        top_p=top_p,
-                    )
-                except Exception as exc:
-                    raise GenerationError(chapter.title, segment.text) from exc
-                wavs.append(wav)
-                if segment.pause_after_ms:
-                    wavs.append(_silence(segment.pause_after_ms, model.sr, like=wav))
-                if progress is not None:
-                    progress.update(1)
-
-            wav = _concat_wavs(wavs)
-            output_path = output_dir / chapter.filename
-            torchaudio.save(str(output_path), wav, model.sr)
-            chapter_paths.append(output_path)
-            chapter_durations.append(_duration_ms(wav, model.sr))
-    finally:
-        if progress is not None:
-            progress.close()
-
-    return chapter_paths, chapter_durations
-
-
 def _safe_filename(value: str) -> str:
     value = re.sub(r"[\\/:*?\"<>|]+", " ", value)
     value = " ".join(value.split()).strip()
@@ -559,146 +966,6 @@ def _run_ffmpeg_wav_speed(output_path: Path, *, speed: float) -> None:
     temp_path.replace(output_path)
 
 
-def _build_audio_segments(
-    blocks: list[str],
-    *,
-    max_chars: int,
-    paragraph_pause_ms: int,
-    dialogue_pause_ms: int,
-) -> list[AudioSegment]:
-    if paragraph_pause_ms < 0:
-        raise ValueError("paragraph_pause_ms must be non-negative")
-    if dialogue_pause_ms < 0:
-        raise ValueError("dialogue_pause_ms must be non-negative")
-
-    segments: list[AudioSegment] = []
-    for block in blocks:
-        block = " ".join(block.split())
-        if not block:
-            continue
-
-        paragraph_segments = _split_dialogue(block, max_chars=max_chars)
-        if not paragraph_segments:
-            continue
-
-        for segment in paragraph_segments:
-            if segment.is_dialogue and segments:
-                previous = segments[-1]
-                segments[-1] = AudioSegment(
-                    text=previous.text,
-                    is_dialogue=previous.is_dialogue,
-                    pause_after_ms=max(previous.pause_after_ms, dialogue_pause_ms),
-                )
-            elif not segment.is_dialogue and segments and segments[-1].is_dialogue:
-                previous = segments[-1]
-                segments[-1] = AudioSegment(
-                    text=previous.text,
-                    is_dialogue=previous.is_dialogue,
-                    pause_after_ms=max(previous.pause_after_ms, dialogue_pause_ms),
-                )
-            segments.append(segment)
-
-        last = segments[-1]
-        segments[-1] = AudioSegment(
-            text=last.text,
-            is_dialogue=last.is_dialogue,
-            pause_after_ms=max(last.pause_after_ms, paragraph_pause_ms),
-        )
-
-    return segments
-
-
-def _split_dialogue(text: str, *, max_chars: int) -> list[AudioSegment]:
-    quote_pairs = {
-        "“": "”",
-        '"': '"',
-        "‘": "’",
-        "'": "'",
-    }
-    segments: list[AudioSegment] = []
-    index = 0
-
-    while index < len(text):
-        next_quote_index = -1
-        next_quote = ""
-        for quote in quote_pairs:
-            found = text.find(quote, index)
-            if found != -1 and (next_quote_index == -1 or found < next_quote_index):
-                next_quote_index = found
-                next_quote = quote
-
-        if next_quote_index == -1:
-            segments.extend(
-                _segments_from_text(
-                    text[index:],
-                    is_dialogue=False,
-                    max_chars=max_chars,
-                    pause_after_ms=0,
-                )
-            )
-            break
-
-        segments.extend(
-            _segments_from_text(
-                text[index:next_quote_index],
-                is_dialogue=False,
-                max_chars=max_chars,
-                pause_after_ms=0,
-            )
-        )
-
-        closing_quote = quote_pairs[next_quote]
-        closing_index = text.find(closing_quote, next_quote_index + 1)
-        if closing_index == -1:
-            segments.extend(
-                _segments_from_text(
-                    text[next_quote_index:],
-                    is_dialogue=False,
-                    max_chars=max_chars,
-                    pause_after_ms=0,
-                )
-            )
-            break
-
-        segments.extend(
-            _segments_from_text(
-                text[next_quote_index : closing_index + 1],
-                is_dialogue=True,
-                max_chars=max_chars,
-                pause_after_ms=0,
-            )
-        )
-        index = closing_index + 1
-
-    return [segment for segment in segments if segment.text]
-
-
-def _segments_from_text(
-    text: str,
-    *,
-    is_dialogue: bool,
-    max_chars: int,
-    pause_after_ms: int,
-) -> list[AudioSegment]:
-    text = " ".join(text.split())
-    if not text:
-        return []
-
-    chunks = _split_oversized(text, max_chars=max_chars)
-    segments = [
-        AudioSegment(text=chunk, is_dialogue=is_dialogue, pause_after_ms=0)
-        for chunk in chunks
-    ]
-    if segments:
-        last = segments[-1]
-        segments[-1] = AudioSegment(
-            text=last.text,
-            is_dialogue=last.is_dialogue,
-            pause_after_ms=pause_after_ms,
-        )
-    return segments
-
-
 def _silence(duration_ms: int, sample_rate: int, *, like: Any | None = None) -> Any:
     import torch
 
@@ -710,34 +977,17 @@ def _silence(duration_ms: int, sample_rate: int, *, like: Any | None = None) -> 
     return torch.zeros(1, samples, **kwargs)
 
 
-def _epub_progress(
-    chapters: list[Any],
-    *,
-    max_chars: int,
-    paragraph_pause_ms: int,
-    dialogue_pause_ms: int,
-    enabled: bool,
-) -> Any:
+def _book_progress(book: Book, *, enabled: bool, output_format: str) -> Any:
     if not enabled:
         return None
 
     from tqdm.auto import tqdm
 
-    total = sum(
-        len(
-            _build_audio_segments(
-                chapter.blocks,
-                max_chars=max_chars,
-                paragraph_pause_ms=paragraph_pause_ms,
-                dialogue_pause_ms=dialogue_pause_ms,
-            )
-        )
-        for chapter in chapters
-    )
+    total = sum(len(chapter.segments) for chapter in book.chapters)
     return tqdm(
         total=total,
-        desc="EPUB",
-        unit="chunk",
+        desc=f"EPUB -> {output_format.upper()}",
+        unit="segment",
         colour="green",
         dynamic_ncols=True,
     )
