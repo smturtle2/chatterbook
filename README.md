@@ -10,6 +10,7 @@ book.convert(
     language="ko",
     voice_path="voices/narrator.wav",
     style="warm",
+    batch_size=8,
     speed=0.9,
 )
 ```
@@ -46,6 +47,11 @@ The default audiobook pacing is intentionally slower than raw TTS:
 M4B output requires `ffmpeg` on your `PATH`. During conversion, chatterbook shows
 one colored `tqdm` progress bar for the whole EPUB. Pass `show_progress=False`
 to disable it.
+
+When `voice_path` is used, conversion prepares voice conditionals once per
+same-style batch instead of once per segment. Tune `batch_size` to control how
+many adjacent narration or dialogue segments are grouped for that preparation
+step.
 
 To export chapter WAV files instead of one M4B:
 

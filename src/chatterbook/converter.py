@@ -231,6 +231,7 @@ class Book:
         show_progress: bool = True,
         device: str | None = None,
         t3_model: str | None = None,
+        batch_size: int = 8,
         overwrite: bool = False,
         speed: float = 0.9,
         exaggeration: float | None = None,
@@ -247,6 +248,8 @@ class Book:
             raise UnsupportedLanguageError(language, sorted(SUPPORTED_LANGUAGES))
         if speed <= 0:
             raise ValueError("speed must be greater than 0")
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
 
         output = _resolve_output_path(
             output_path,
@@ -269,6 +272,7 @@ class Book:
                 generation_style=generation_style,
                 device=device,
                 t3_model=t3_model,
+                batch_size=batch_size,
                 overwrite=overwrite,
                 speed=speed,
                 dialogue_exaggeration=dialogue_exaggeration,
@@ -291,6 +295,7 @@ class Book:
             generation_style=generation_style,
             device=device,
             t3_model=t3_model,
+            batch_size=batch_size,
             overwrite=overwrite,
             bitrate=bitrate,
             keep_temp=keep_temp,
@@ -355,6 +360,7 @@ def _convert_book_to_wavs(
     generation_style: Any,
     device: str | None,
     t3_model: str | None,
+    batch_size: int,
     overwrite: bool,
     speed: float,
     dialogue_exaggeration: float,
@@ -385,6 +391,7 @@ def _convert_book_to_wavs(
                 language_id=language_id,
                 voice_prompt_path=voice_prompt_path,
                 generation_style=generation_style,
+                batch_size=batch_size,
                 dialogue_exaggeration=dialogue_exaggeration,
                 dialogue_cfg_weight=dialogue_cfg_weight,
                 show_progress=show_progress,
@@ -415,6 +422,7 @@ def _convert_book_to_m4b(
     generation_style: Any,
     device: str | None,
     t3_model: str | None,
+    batch_size: int,
     overwrite: bool,
     bitrate: str,
     keep_temp: bool,
@@ -453,6 +461,7 @@ def _convert_book_to_m4b(
             generation_style=generation_style,
             device=device,
             t3_model=t3_model,
+            batch_size=batch_size,
             dialogue_exaggeration=dialogue_exaggeration,
             dialogue_cfg_weight=dialogue_cfg_weight,
             show_progress=show_progress,
@@ -498,6 +507,7 @@ def _write_chapter_wavs(
     generation_style: Any,
     device: str | None,
     t3_model: str | None,
+    batch_size: int,
     dialogue_exaggeration: float,
     dialogue_cfg_weight: float,
     show_progress: bool,
@@ -520,6 +530,7 @@ def _write_chapter_wavs(
                 language_id=language_id,
                 voice_prompt_path=voice_prompt_path,
                 generation_style=generation_style,
+                batch_size=batch_size,
                 dialogue_exaggeration=dialogue_exaggeration,
                 dialogue_cfg_weight=dialogue_cfg_weight,
                 show_progress=show_progress,
@@ -547,6 +558,7 @@ def _render_chapter_wav(
     language_id: str,
     voice_prompt_path: Path | None,
     generation_style: Any,
+    batch_size: int,
     dialogue_exaggeration: float,
     dialogue_cfg_weight: float,
     show_progress: bool,
@@ -557,40 +569,91 @@ def _render_chapter_wav(
     top_p: float,
 ) -> tuple[Any, int]:
     wavs = []
-    for index, segment in enumerate(chapter.segments, start=1):
-        try:
-            wav = _generate_audio(
-                model,
-                segment.text,
-                show_progress=show_progress,
-                language_id=language_id,
-                audio_prompt_path=str(voice_prompt_path) if voice_prompt_path else None,
-                exaggeration=dialogue_exaggeration
-                if segment.is_dialogue
-                else generation_style.exaggeration,
-                cfg_weight=dialogue_cfg_weight
-                if segment.is_dialogue
-                else generation_style.cfg_weight,
-                temperature=temperature,
-                repetition_penalty=repetition_penalty,
-                min_p=min_p,
-                top_p=top_p,
-            )
-        except Exception as exc:
-            raise GenerationError(chapter.title, segment.text) from exc
-        wavs.append(wav)
-        if segment.pause_after_ms:
-            wavs.append(_silence(segment.pause_after_ms, model.sr, like=wav))
-        if progress is not None:
-            progress.set_postfix(
-                chapter=chapter.title[:24],
-                segment=f"{index}/{len(chapter.segments)}",
-                refresh=False,
-            )
-            progress.update(1)
+    rendered_count = 0
+    for batch in _audio_batches(chapter.segments, batch_size=batch_size):
+        exaggeration = (
+            dialogue_exaggeration
+            if batch[0].is_dialogue
+            else generation_style.exaggeration
+        )
+        cfg_weight = (
+            dialogue_cfg_weight if batch[0].is_dialogue else generation_style.cfg_weight
+        )
+        prompt_path = _prepare_batch_conditionals(
+            model,
+            voice_prompt_path=voice_prompt_path,
+            exaggeration=exaggeration,
+        )
+        for segment in batch:
+            try:
+                wav = _generate_audio(
+                    model,
+                    segment.text,
+                    show_progress=show_progress,
+                    language_id=language_id,
+                    audio_prompt_path=prompt_path,
+                    exaggeration=exaggeration,
+                    cfg_weight=cfg_weight,
+                    temperature=temperature,
+                    repetition_penalty=repetition_penalty,
+                    min_p=min_p,
+                    top_p=top_p,
+                )
+            except Exception as exc:
+                raise GenerationError(chapter.title, segment.text) from exc
+            wavs.append(wav)
+            if segment.pause_after_ms:
+                wavs.append(_silence(segment.pause_after_ms, model.sr, like=wav))
+            rendered_count += 1
+            if progress is not None:
+                progress.set_postfix(
+                    chapter=chapter.title[:24],
+                    segment=f"{rendered_count}/{len(chapter.segments)}",
+                    batch=len(batch),
+                    refresh=False,
+                )
+                progress.update(1)
 
     wav = _concat_wavs(wavs)
     return wav, _duration_ms(wav, model.sr)
+
+
+def _audio_batches(
+    segments: list[AudioSegment],
+    *,
+    batch_size: int,
+) -> list[list[AudioSegment]]:
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
+
+    batches: list[list[AudioSegment]] = []
+    current: list[AudioSegment] = []
+    for segment in segments:
+        if (
+            current
+            and (segment.kind != current[-1].kind or len(current) >= batch_size)
+        ):
+            batches.append(current)
+            current = []
+        current.append(segment)
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _prepare_batch_conditionals(
+    model: Any,
+    *,
+    voice_prompt_path: Path | None,
+    exaggeration: float,
+) -> str | None:
+    if voice_prompt_path is None:
+        return None
+    if not hasattr(model, "prepare_conditionals"):
+        return str(voice_prompt_path)
+
+    model.prepare_conditionals(str(voice_prompt_path), exaggeration=exaggeration)
+    return None
 
 
 def _build_audio_segments(

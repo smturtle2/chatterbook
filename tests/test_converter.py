@@ -28,6 +28,15 @@ class FakeModel:
         return torch.zeros(1, 10)
 
 
+class BatchFakeModel(FakeModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.conditionals = []
+
+    def prepare_conditionals(self, audio_prompt_path, **kwargs):
+        self.conditionals.append((audio_prompt_path, kwargs))
+
+
 class FailingModel:
     sr = 24000
 
@@ -95,6 +104,41 @@ def fake_book_dict() -> dict:
             },
         ],
     }
+
+
+def batch_book_dict() -> dict:
+    data = fake_book_dict()
+    data["chapters"] = [
+        {
+            "index": 1,
+            "title": "Intro",
+            "filename": "001-intro.wav",
+            "paragraphs": [
+                {
+                    "index": 1,
+                    "text": "one two three",
+                    "segments": [
+                        {
+                            "text": "one",
+                            "kind": "narration",
+                            "pause_after_ms": 0,
+                        },
+                        {
+                            "text": "two",
+                            "kind": "narration",
+                            "pause_after_ms": 0,
+                        },
+                        {
+                            "text": "three",
+                            "kind": "narration",
+                            "pause_after_ms": 0,
+                        },
+                    ],
+                }
+            ],
+        }
+    ]
+    return data
 
 
 def test_book_serializes_paragraphs_dialogue_and_pauses(monkeypatch, tmp_path):
@@ -182,6 +226,48 @@ def test_book_convert_passes_voice_path_and_style(monkeypatch, tmp_path):
     assert fake_model.calls[0][1]["exaggeration"] == 0.6
     assert fake_model.calls[0][1]["cfg_weight"] == 0.45
     assert len(fake_torchaudio.saved) == 2
+
+
+def test_book_convert_prepares_voice_conditionals_per_batch(monkeypatch, tmp_path):
+    fake_model = BatchFakeModel()
+    voice_path = tmp_path / "voice.wav"
+    voice_path.write_bytes(b"voice")
+
+    monkeypatch.setattr(converter, "_load_model", lambda **_: fake_model)
+    monkeypatch.setattr(converter, "_import_torchaudio", lambda: FakeTorchaudio())
+
+    Book.from_dict(batch_book_dict()).convert(
+        tmp_path / "audio",
+        language="ko",
+        voice_path=voice_path,
+        output_format="wav",
+        speed=1.0,
+        batch_size=2,
+    )
+
+    assert fake_model.conditionals == [
+        (str(voice_path), {"exaggeration": 0.5}),
+        (str(voice_path), {"exaggeration": 0.5}),
+    ]
+    assert [call[0] for call in fake_model.calls] == ["one", "two", "three"]
+    assert all(call[1]["audio_prompt_path"] is None for call in fake_model.calls)
+
+
+def test_audio_batches_group_by_kind_and_size():
+    segments = [
+        converter.AudioSegment("one"),
+        converter.AudioSegment("two"),
+        converter.AudioSegment("three"),
+        converter.AudioSegment("quote", kind="dialogue"),
+    ]
+
+    batches = converter._audio_batches(segments, batch_size=2)
+
+    assert [[segment.text for segment in batch] for batch in batches] == [
+        ["one", "two"],
+        ["three"],
+        ["quote"],
+    ]
 
 
 def test_explicit_generation_values_override_style(monkeypatch, tmp_path):
