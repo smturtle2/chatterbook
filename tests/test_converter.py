@@ -180,6 +180,17 @@ def test_book_round_trips_from_dict():
     assert Book.from_dict(data).to_dict() == data
 
 
+def test_book_from_dict_precomputes_runtime_audio_plan():
+    book = Book.from_dict(batch_book_dict())
+
+    assert book.total_segments == 3
+    assert [segment.text for segment in book.chapters[0].segments] == [
+        "one",
+        "two",
+        "three",
+    ]
+
+
 def test_straight_apostrophe_does_not_create_dialogue(monkeypatch, tmp_path):
     monkeypatch.setattr(
         converter,
@@ -391,12 +402,77 @@ def test_build_audio_segments_splits_sentences_and_oversized_chunks():
         paragraph_pause_ms=600,
     )
 
-    assert segments[0] == converter.AudioSegment(
-        "첫 문장입니다.", kind="narration", pause_after_ms=300
-    )
     assert len(segments) > 1
     assert all(len(segment.text) <= 120 for segment in segments)
     assert segments[-1].pause_after_ms == 600
+
+
+def test_build_audio_segments_compacts_same_kind_sentences_for_fewer_tts_calls():
+    segments = converter._build_audio_segments(
+        ["첫 문장입니다. 둘째 문장입니다. 셋째 문장입니다."],
+        max_chars=120,
+        paragraph_pause_ms=600,
+    )
+
+    assert segments == [
+        converter.AudioSegment(
+            "첫 문장입니다. 둘째 문장입니다. 셋째 문장입니다.",
+            kind="narration",
+            pause_after_ms=600,
+        )
+    ]
+
+
+def test_build_audio_segments_keeps_dialogue_boundaries_when_compacting():
+    segments = converter._build_audio_segments(
+        ["렌은 말했다. “불.” 아무 일도 없었다. 다음 문장이다."],
+        max_chars=120,
+        paragraph_pause_ms=600,
+        dialogue_pause_ms=300,
+    )
+
+    assert segments == [
+        converter.AudioSegment("렌은 말했다.", kind="narration", pause_after_ms=300),
+        converter.AudioSegment("“불.”", kind="dialogue", pause_after_ms=300),
+        converter.AudioSegment(
+            "아무 일도 없었다. 다음 문장이다.",
+            kind="narration",
+            pause_after_ms=600,
+        ),
+    ]
+
+
+def test_build_audio_segments_compacts_adjacent_dialogue_only_with_dialogue():
+    segments = converter._build_audio_segments(
+        ['“불.” “물.” 그는 숨을 골랐다. “바람.”'],
+        max_chars=120,
+        paragraph_pause_ms=600,
+        dialogue_pause_ms=300,
+    )
+
+    assert segments == [
+        converter.AudioSegment("“불.” “물.”", kind="dialogue", pause_after_ms=300),
+        converter.AudioSegment("그는 숨을 골랐다.", kind="narration", pause_after_ms=300),
+        converter.AudioSegment("“바람.”", kind="dialogue", pause_after_ms=600),
+    ]
+
+
+def test_audio_batches_never_mix_narration_and_dialogue():
+    segments = [
+        converter.AudioSegment("narration one", kind="narration"),
+        converter.AudioSegment("narration two", kind="narration"),
+        converter.AudioSegment("dialogue one", kind="dialogue"),
+        converter.AudioSegment("dialogue two", kind="dialogue"),
+        converter.AudioSegment("narration three", kind="narration"),
+    ]
+
+    batches = converter._audio_batches(segments, batch_size=8)
+
+    assert [[segment.kind for segment in batch] for batch in batches] == [
+        ["narration", "narration"],
+        ["dialogue", "dialogue"],
+        ["narration"],
+    ]
 
 
 def test_silence_matches_reference_tensor():

@@ -105,14 +105,7 @@ class BookChapter:
     title: str
     filename: str
     paragraphs: list[BookParagraph]
-
-    @property
-    def segments(self) -> list[AudioSegment]:
-        return [
-            segment
-            for paragraph in self.paragraphs
-            for segment in paragraph.segments
-        ]
+    segments: list[AudioSegment]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -124,14 +117,16 @@ class BookChapter:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> BookChapter:
+        paragraphs = [
+            BookParagraph.from_dict(paragraph)
+            for paragraph in data.get("paragraphs", [])
+        ]
         return cls(
             index=int(data["index"]),
             title=str(data["title"]),
             filename=str(data["filename"]),
-            paragraphs=[
-                BookParagraph.from_dict(paragraph)
-                for paragraph in data.get("paragraphs", [])
-            ],
+            paragraphs=paragraphs,
+            segments=_flatten_paragraph_segments(paragraphs),
         )
 
 
@@ -172,6 +167,7 @@ class Book:
             paragraph_pause_ms=paragraph_pause_ms,
             dialogue_pause_ms=dialogue_pause_ms,
         )
+        self.total_segments = _count_segments(self.chapters)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -216,6 +212,7 @@ class Book:
         book.chapters = [
             BookChapter.from_dict(chapter) for chapter in data.get("chapters", [])
         ]
+        book.total_segments = _count_segments(book.chapters)
         return book
 
     def convert(
@@ -346,9 +343,22 @@ def _build_book_chapters(
                 title=chapter.title,
                 filename=chapter.filename,
                 paragraphs=paragraphs,
+                segments=_flatten_paragraph_segments(paragraphs),
             )
         )
     return book_chapters
+
+
+def _flatten_paragraph_segments(paragraphs: list[BookParagraph]) -> list[AudioSegment]:
+    return [
+        segment
+        for paragraph in paragraphs
+        for segment in paragraph.segments
+    ]
+
+
+def _count_segments(chapters: list[BookChapter]) -> int:
+    return sum(len(chapter.segments) for chapter in chapters)
 
 
 def _convert_book_to_wavs(
@@ -686,6 +696,10 @@ def _build_audio_segments(
             comma_pause_ms=comma_pause_ms,
             sentence_pause_ms=sentence_pause_ms,
         )
+        paragraph_segments = _compact_audio_segments(
+            paragraph_segments,
+            max_chars=max_chars,
+        )
         if not paragraph_segments:
             continue
 
@@ -716,6 +730,36 @@ def _build_audio_segments(
                 )
 
     return segments
+
+
+def _compact_audio_segments(
+    segments: list[AudioSegment],
+    *,
+    max_chars: int,
+) -> list[AudioSegment]:
+    compacted: list[AudioSegment] = []
+    current: AudioSegment | None = None
+
+    for segment in segments:
+        if current is None:
+            current = segment
+            continue
+
+        combined_text = f"{current.text} {segment.text}"
+        if current.kind == segment.kind and len(combined_text) <= max_chars:
+            current = AudioSegment(
+                text=combined_text,
+                kind=current.kind,
+                pause_after_ms=segment.pause_after_ms,
+            )
+            continue
+
+        compacted.append(current)
+        current = segment
+
+    if current is not None:
+        compacted.append(current)
+    return compacted
 
 
 def _split_dialogue(
@@ -1046,9 +1090,8 @@ def _book_progress(book: Book, *, enabled: bool, output_format: str) -> Any:
 
     from tqdm.auto import tqdm
 
-    total = sum(len(chapter.segments) for chapter in book.chapters)
     return tqdm(
-        total=total,
+        total=book.total_segments,
         desc=f"EPUB -> {output_format.upper()}",
         unit="segment",
         colour="green",
