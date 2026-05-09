@@ -16,7 +16,7 @@ from .styles import resolve_style
 
 SCHEMA_VERSION = 1
 DEFAULT_MAX_CHARS = 300
-DEFAULT_COMMA_PAUSE_MS = 120
+DEFAULT_COMMA_PAUSE_MS = 200
 DEFAULT_SENTENCE_PAUSE_MS = 300
 DEFAULT_PARAGRAPH_PAUSE_MS = 600
 DEFAULT_DIALOGUE_PAUSE_MS = 300
@@ -221,6 +221,8 @@ class Book:
         *,
         language: str,
         voice_path: str | Path | None = None,
+        narrator_voice_path: str | Path | None = None,
+        dialogue_voice_path: str | Path | None = None,
         style: str = "neutral",
         output_format: Literal["m4b", "wav"] = "m4b",
         bitrate: str = "128k",
@@ -253,7 +255,11 @@ class Book:
             output_format=output_format,
             book_title=self.title,
         )
-        voice_prompt_path = _resolve_voice_path(voice_path)
+        narrator_prompt_path, dialogue_prompt_path = _resolve_voice_paths(
+            voice_path=voice_path,
+            narrator_voice_path=narrator_voice_path,
+            dialogue_voice_path=dialogue_voice_path,
+        )
         generation_style = resolve_style(
             style,
             exaggeration=exaggeration,
@@ -265,7 +271,8 @@ class Book:
                 self,
                 output,
                 language_id=language_id,
-                voice_prompt_path=voice_prompt_path,
+                narrator_prompt_path=narrator_prompt_path,
+                dialogue_prompt_path=dialogue_prompt_path,
                 generation_style=generation_style,
                 device=device,
                 t3_model=t3_model,
@@ -288,7 +295,8 @@ class Book:
             self,
             output,
             language_id=language_id,
-            voice_prompt_path=voice_prompt_path,
+            narrator_prompt_path=narrator_prompt_path,
+            dialogue_prompt_path=dialogue_prompt_path,
             generation_style=generation_style,
             device=device,
             t3_model=t3_model,
@@ -366,7 +374,8 @@ def _convert_book_to_wavs(
     output_dir: Path,
     *,
     language_id: str,
-    voice_prompt_path: Path | None,
+    narrator_prompt_path: Path | None,
+    dialogue_prompt_path: Path | None,
     generation_style: Any,
     device: str | None,
     t3_model: str | None,
@@ -399,7 +408,8 @@ def _convert_book_to_wavs(
                 chapter,
                 model,
                 language_id=language_id,
-                voice_prompt_path=voice_prompt_path,
+                narrator_prompt_path=narrator_prompt_path,
+                dialogue_prompt_path=dialogue_prompt_path,
                 generation_style=generation_style,
                 batch_size=batch_size,
                 dialogue_exaggeration=dialogue_exaggeration,
@@ -428,7 +438,8 @@ def _convert_book_to_m4b(
     output_path: Path,
     *,
     language_id: str,
-    voice_prompt_path: Path | None,
+    narrator_prompt_path: Path | None,
+    dialogue_prompt_path: Path | None,
     generation_style: Any,
     device: str | None,
     t3_model: str | None,
@@ -467,7 +478,8 @@ def _convert_book_to_m4b(
             book,
             temp_dir,
             language_id=language_id,
-            voice_prompt_path=voice_prompt_path,
+            narrator_prompt_path=narrator_prompt_path,
+            dialogue_prompt_path=dialogue_prompt_path,
             generation_style=generation_style,
             device=device,
             t3_model=t3_model,
@@ -513,7 +525,8 @@ def _write_chapter_wavs(
     output_dir: Path,
     *,
     language_id: str,
-    voice_prompt_path: Path | None,
+    narrator_prompt_path: Path | None,
+    dialogue_prompt_path: Path | None,
     generation_style: Any,
     device: str | None,
     t3_model: str | None,
@@ -538,7 +551,8 @@ def _write_chapter_wavs(
                 chapter,
                 model,
                 language_id=language_id,
-                voice_prompt_path=voice_prompt_path,
+                narrator_prompt_path=narrator_prompt_path,
+                dialogue_prompt_path=dialogue_prompt_path,
                 generation_style=generation_style,
                 batch_size=batch_size,
                 dialogue_exaggeration=dialogue_exaggeration,
@@ -566,7 +580,8 @@ def _render_chapter_wav(
     model: Any,
     *,
     language_id: str,
-    voice_prompt_path: Path | None,
+    narrator_prompt_path: Path | None,
+    dialogue_prompt_path: Path | None,
     generation_style: Any,
     batch_size: int,
     dialogue_exaggeration: float,
@@ -588,6 +603,9 @@ def _render_chapter_wav(
         )
         cfg_weight = (
             dialogue_cfg_weight if batch[0].is_dialogue else generation_style.cfg_weight
+        )
+        voice_prompt_path = (
+            dialogue_prompt_path if batch[0].is_dialogue else narrator_prompt_path
         )
         prompt_path = _prepare_batch_conditionals(
             model,
@@ -1111,7 +1129,26 @@ def _generate_audio(
     **kwargs: Any,
 ) -> Any:
     with _suppress_model_progress(enabled=show_progress):
+        if _supports_chatterbox_hook_cleanup(model):
+            _clear_chatterbox_attention_hooks(model)
+            try:
+                return model.generate(text, **kwargs)
+            finally:
+                _clear_chatterbox_attention_hooks(model)
         return model.generate(text, **kwargs)
+
+
+def _supports_chatterbox_hook_cleanup(model: Any) -> bool:
+    return hasattr(model, "t3") and hasattr(model.t3, "tfmr")
+
+
+def _clear_chatterbox_attention_hooks(model: Any) -> None:
+    layers = getattr(getattr(model.t3, "tfmr", None), "layers", [])
+    for layer in layers:
+        self_attn = getattr(layer, "self_attn", None)
+        forward_hooks = getattr(self_attn, "_forward_hooks", None)
+        if forward_hooks is not None:
+            forward_hooks.clear()
 
 
 @contextmanager
@@ -1157,6 +1194,26 @@ def _resolve_voice_path(voice_path: str | Path | None) -> Path | None:
     if not path.is_file():
         raise FileNotFoundError(f"voice_path does not exist: {path}")
     return path
+
+
+def _resolve_voice_paths(
+    *,
+    voice_path: str | Path | None,
+    narrator_voice_path: str | Path | None,
+    dialogue_voice_path: str | Path | None,
+) -> tuple[Path | None, Path | None]:
+    shared_path = _resolve_voice_path(voice_path)
+    narrator_path = (
+        _resolve_voice_path(narrator_voice_path)
+        if narrator_voice_path is not None
+        else shared_path
+    )
+    dialogue_path = (
+        _resolve_voice_path(dialogue_voice_path)
+        if dialogue_voice_path is not None
+        else shared_path
+    )
+    return narrator_path, dialogue_path
 
 
 def _split_text(text: str, *, max_chars: int) -> list[str]:
@@ -1235,6 +1292,7 @@ def _concat_wavs(wavs: list[Any]) -> Any:
 
 def _load_model(*, device: str | None, t3_model: str | None) -> Any:
     _install_pkg_resources_shim()
+    _install_chatterbox_eos_workaround()
     from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 
     selected_device = device or _default_device()
@@ -1242,6 +1300,28 @@ def _load_model(*, device: str | None, t3_model: str | None) -> Any:
     if t3_model is not None:
         kwargs["t3_model"] = t3_model
     return ChatterboxMultilingualTTS.from_pretrained(**kwargs)
+
+
+def _install_chatterbox_eos_workaround() -> None:
+    from chatterbox.models.t3.inference.alignment_stream_analyzer import (
+        AlignmentStreamAnalyzer,
+    )
+
+    if getattr(AlignmentStreamAnalyzer.step, "_chatterbook_eos_workaround", False):
+        return
+
+    original_step = AlignmentStreamAnalyzer.step
+
+    def step_without_token_repetition_eos(
+        self: Any,
+        logits: Any,
+        next_token: Any = None,
+    ) -> Any:
+        return original_step(self, logits, next_token=None)
+
+    step_without_token_repetition_eos._chatterbook_eos_workaround = True
+    step_without_token_repetition_eos._chatterbook_original_step = original_step
+    AlignmentStreamAnalyzer.step = step_without_token_repetition_eos
 
 
 def _install_pkg_resources_shim() -> None:

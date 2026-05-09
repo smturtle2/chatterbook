@@ -60,7 +60,7 @@ def fake_book_dict() -> dict:
         "source_path": None,
         "max_chars": 300,
         "pause_defaults": {
-            "comma_pause_ms": 120,
+            "comma_pause_ms": 200,
             "sentence_pause_ms": 300,
             "paragraph_pause_ms": 600,
             "dialogue_pause_ms": 300,
@@ -130,6 +130,41 @@ def batch_book_dict() -> dict:
                         },
                         {
                             "text": "three",
+                            "kind": "narration",
+                            "pause_after_ms": 0,
+                        },
+                    ],
+                }
+            ],
+        }
+    ]
+    return data
+
+
+def mixed_voice_book_dict() -> dict:
+    data = fake_book_dict()
+    data["chapters"] = [
+        {
+            "index": 1,
+            "title": "Intro",
+            "filename": "001-intro.wav",
+            "paragraphs": [
+                {
+                    "index": 1,
+                    "text": "narration quote more",
+                    "segments": [
+                        {
+                            "text": "narration",
+                            "kind": "narration",
+                            "pause_after_ms": 0,
+                        },
+                        {
+                            "text": "quote",
+                            "kind": "dialogue",
+                            "pause_after_ms": 0,
+                        },
+                        {
+                            "text": "more",
                             "kind": "narration",
                             "pause_after_ms": 0,
                         },
@@ -261,6 +296,131 @@ def test_book_convert_prepares_voice_conditionals_per_batch(monkeypatch, tmp_pat
         (str(voice_path), {"exaggeration": 0.5}),
     ]
     assert [call[0] for call in fake_model.calls] == ["one", "two", "three"]
+    assert all(call[1]["audio_prompt_path"] is None for call in fake_model.calls)
+
+
+def test_book_convert_uses_separate_narrator_and_dialogue_voices(monkeypatch, tmp_path):
+    fake_model = FakeModel()
+    narrator_voice_path = tmp_path / "narrator.wav"
+    dialogue_voice_path = tmp_path / "dialogue.wav"
+    narrator_voice_path.write_bytes(b"narrator")
+    dialogue_voice_path.write_bytes(b"dialogue")
+
+    monkeypatch.setattr(converter, "_load_model", lambda **_: fake_model)
+    monkeypatch.setattr(converter, "_import_torchaudio", lambda: FakeTorchaudio())
+
+    Book.from_dict(mixed_voice_book_dict()).convert(
+        tmp_path / "audio",
+        language="ko",
+        narrator_voice_path=narrator_voice_path,
+        dialogue_voice_path=dialogue_voice_path,
+        output_format="wav",
+        speed=1.0,
+    )
+
+    assert [call[0] for call in fake_model.calls] == [
+        "narration",
+        "quote",
+        "more",
+    ]
+    assert [call[1]["audio_prompt_path"] for call in fake_model.calls] == [
+        str(narrator_voice_path),
+        str(dialogue_voice_path),
+        str(narrator_voice_path),
+    ]
+
+
+def test_book_convert_voice_path_is_default_for_specific_voice_overrides(
+    monkeypatch,
+    tmp_path,
+):
+    fake_model = FakeModel()
+    shared_voice_path = tmp_path / "shared.wav"
+    dialogue_voice_path = tmp_path / "dialogue.wav"
+    shared_voice_path.write_bytes(b"shared")
+    dialogue_voice_path.write_bytes(b"dialogue")
+
+    monkeypatch.setattr(converter, "_load_model", lambda **_: fake_model)
+    monkeypatch.setattr(converter, "_import_torchaudio", lambda: FakeTorchaudio())
+
+    Book.from_dict(mixed_voice_book_dict()).convert(
+        tmp_path / "audio",
+        language="ko",
+        voice_path=shared_voice_path,
+        dialogue_voice_path=dialogue_voice_path,
+        output_format="wav",
+        speed=1.0,
+    )
+
+    assert [call[1]["audio_prompt_path"] for call in fake_model.calls] == [
+        str(shared_voice_path),
+        str(dialogue_voice_path),
+        str(shared_voice_path),
+    ]
+
+
+def test_book_convert_uses_default_tts_for_unspecified_dialogue_voice(
+    monkeypatch,
+    tmp_path,
+):
+    fake_model = FakeModel()
+    narrator_voice_path = tmp_path / "narrator.wav"
+    narrator_voice_path.write_bytes(b"narrator")
+
+    monkeypatch.setattr(converter, "_load_model", lambda **_: fake_model)
+    monkeypatch.setattr(converter, "_import_torchaudio", lambda: FakeTorchaudio())
+
+    Book.from_dict(mixed_voice_book_dict()).convert(
+        tmp_path / "audio",
+        language="ko",
+        narrator_voice_path=narrator_voice_path,
+        output_format="wav",
+        speed=1.0,
+    )
+
+    assert [call[1]["audio_prompt_path"] for call in fake_model.calls] == [
+        str(narrator_voice_path),
+        None,
+        str(narrator_voice_path),
+    ]
+
+
+def test_book_convert_rejects_missing_dialogue_voice_path(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        Book.from_dict(mixed_voice_book_dict()).convert(
+            tmp_path / "audio",
+            language="ko",
+            output_format="wav",
+            speed=1.0,
+            dialogue_voice_path=tmp_path / "missing.wav",
+        )
+
+
+def test_book_convert_prepares_separate_voice_conditionals(monkeypatch, tmp_path):
+    fake_model = BatchFakeModel()
+    narrator_voice_path = tmp_path / "narrator.wav"
+    dialogue_voice_path = tmp_path / "dialogue.wav"
+    narrator_voice_path.write_bytes(b"narrator")
+    dialogue_voice_path.write_bytes(b"dialogue")
+
+    monkeypatch.setattr(converter, "_load_model", lambda **_: fake_model)
+    monkeypatch.setattr(converter, "_import_torchaudio", lambda: FakeTorchaudio())
+
+    Book.from_dict(mixed_voice_book_dict()).convert(
+        tmp_path / "audio",
+        language="ko",
+        narrator_voice_path=narrator_voice_path,
+        dialogue_voice_path=dialogue_voice_path,
+        output_format="wav",
+        speed=1.0,
+        batch_size=8,
+    )
+
+    assert fake_model.conditionals == [
+        (str(narrator_voice_path), {"exaggeration": 0.5}),
+        (str(dialogue_voice_path), {"exaggeration": 0.7}),
+        (str(narrator_voice_path), {"exaggeration": 0.5}),
+    ]
     assert all(call[1]["audio_prompt_path"] is None for call in fake_model.calls)
 
 
@@ -433,6 +593,14 @@ def test_build_audio_segments_preserves_sentence_pauses_by_default():
     ]
 
 
+def test_build_audio_segments_preserves_terminal_korean_syllable():
+    segments = converter._build_audio_segments(["했다."], max_chars=120)
+
+    assert segments == [
+        converter.AudioSegment("했다.", kind="narration", pause_after_ms=600)
+    ]
+
+
 def test_build_audio_segments_keeps_dialogue_boundaries_when_compacting():
     segments = converter._build_audio_segments(
         ["렌은 말했다. “불.” 아무 일도 없었다. 다음 문장이다."],
@@ -588,6 +756,38 @@ def test_pkg_resources_shim_supports_resource_filename(monkeypatch):
     assert path.endswith("chatterbook/__init__.py")
 
 
+def test_chatterbox_eos_workaround_disables_token_repetition_eos(monkeypatch):
+    from chatterbox.models.t3.inference.alignment_stream_analyzer import (
+        AlignmentStreamAnalyzer,
+    )
+
+    calls = []
+
+    def fake_step(self, logits, next_token=None):
+        calls.append(next_token)
+        return logits
+
+    original_step = getattr(
+        AlignmentStreamAnalyzer.step,
+        "_chatterbook_original_step",
+        AlignmentStreamAnalyzer.step,
+    )
+    monkeypatch.setattr(AlignmentStreamAnalyzer, "step", original_step)
+    monkeypatch.setattr(AlignmentStreamAnalyzer, "step", fake_step)
+
+    converter._install_chatterbox_eos_workaround()
+    patched_step = AlignmentStreamAnalyzer.step
+    converter._install_chatterbox_eos_workaround()
+
+    assert AlignmentStreamAnalyzer.step is patched_step
+    assert AlignmentStreamAnalyzer.step(
+        SimpleNamespace(),
+        "logits",
+        next_token=123,
+    ) == "logits"
+    assert calls == [None]
+
+
 def test_generate_audio_suppresses_model_output(capsys):
     class LoudModel:
         def generate(self, text, **kwargs):
@@ -622,3 +822,37 @@ def test_generate_audio_keeps_model_output_when_progress_disabled(capsys):
     captured = capsys.readouterr()
     assert result == "hello"
     assert captured.out == "visible\n"
+
+
+def test_generate_audio_clears_chatterbox_attention_hooks():
+    class FakeAttention:
+        def __init__(self):
+            self._forward_hooks = {1: "stale"}
+
+    class FakeLayer:
+        def __init__(self):
+            self.self_attn = FakeAttention()
+
+    class FakeModel:
+        def __init__(self):
+            self.layer = FakeLayer()
+            self.t3 = SimpleNamespace(tfmr=SimpleNamespace(layers=[self.layer]))
+            self.seen_hooks = None
+
+        def generate(self, text, **kwargs):
+            self.seen_hooks = dict(self.layer.self_attn._forward_hooks)
+            self.layer.self_attn._forward_hooks[2] = "new"
+            return text, kwargs
+
+    model = FakeModel()
+
+    result = converter._generate_audio(
+        model,
+        "했다.",
+        show_progress=False,
+        language_id="ko",
+    )
+
+    assert result == ("했다.", {"language_id": "ko"})
+    assert model.seen_hooks == {}
+    assert model.layer.self_attn._forward_hooks == {}

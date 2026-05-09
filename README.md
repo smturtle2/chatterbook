@@ -29,7 +29,10 @@ By default, the output filename is read from the EPUB title metadata and written
 as `Title.m4b` in the current directory. You can also pass a path or directory.
 
 `voice_path` is an optional short WAV reference clip for voice cloning. If it is
-omitted, Chatterbox's bundled default conditionals are used.
+omitted, Chatterbox's bundled default conditionals are used. To use separate
+voices for narration and dialogue, pass `narrator_voice_path` and
+`dialogue_voice_path`. When combined with `voice_path`, the shared voice is used
+as the default and the narrator/dialogue-specific paths override their side.
 
 Chapters are split into paragraph and speech segments when the `Book` is built.
 Quoted dialogue is marked separately and generated with slightly more expressive
@@ -39,7 +42,7 @@ transitions add real silence after each segment to improve audiobook pacing.
 The default audiobook pacing is intentionally slower than raw TTS:
 
 - `speed=0.9`
-- `comma_pause_ms=120`
+- `comma_pause_ms=200`
 - `sentence_pause_ms=300`
 - `paragraph_pause_ms=600`
 - `dialogue_pause_ms=300`
@@ -52,6 +55,14 @@ When `voice_path` is used, conversion prepares voice conditionals once per
 same-style batch instead of once per segment. Tune `batch_size` to control how
 many adjacent narration or dialogue segments are grouped for that preparation
 step.
+
+```python
+book.convert(
+    language="ko",
+    narrator_voice_path="voices/narrator.wav",
+    dialogue_voice_path="voices/dialogue.wav",
+)
+```
 
 To export chapter WAV files instead of one M4B:
 
